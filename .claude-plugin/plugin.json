@@ -1,0 +1,11 @@
+{
+  "name": "better-ui",
+  "displayName": "Better UI",
+  "version": "0.1.0",
+  "description": "A better Claude Code interface: a side panel for status, usage, history, agents and edited files; a cleaner transcript; a matching theme",
+  "author": {
+    "name": "Yooouuuuuuu"
+  },
+  "license": "Unlicense",
+  "types": "./types/index.d.ts"
+}

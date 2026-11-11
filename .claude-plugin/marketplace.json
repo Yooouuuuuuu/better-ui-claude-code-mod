@@ -1,0 +1,14 @@
+{
+  "name": "better-ui-claude-code-mod",
+  "description": "Better UI, a Claude Code mod that redraws the terminal interface",
+  "owner": {
+    "name": "Yooouuuuuuu"
+  },
+  "plugins": [
+    {
+      "name": "better-ui",
+      "source": "./",
+      "description": "A better Claude Code interface: a side panel for status, usage, history, agents and edited files; a cleaner transcript; a matching theme"
+    }
+  ]
+}
