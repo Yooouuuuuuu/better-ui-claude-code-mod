@@ -3,7 +3,6 @@
 
 import type { PromptDecoration } from 'claude-code'
 
-import type { FileStat, Totals, TurnRec } from '../types'
 
 // ---------------------------------------------------------------------------
 // Small utilities
@@ -29,7 +28,6 @@ export const fmtSeconds = (s: number): string =>
 export const fmtTokens = (n: number): string =>
   n >= 1_000_000 ? `${(n / 1_000_000).toFixed(1)}M` : n >= 1000 ? `${(n / 1000).toFixed(1)}k` : `${n}`
 
-export const fmtUsd = (usd: number | undefined): string => (usd === undefined ? '—' : `$${usd.toFixed(2)}`)
 
 export const hhmm = (ms: number): string => {
   const d = new Date(ms)
@@ -45,22 +43,6 @@ export const relTime = (iso: string, now: number): string => {
   const h = Math.floor(m / 60)
   if (h < 48) return `in ${h}h ${String(m % 60).padStart(2, '0')}m`
   return `in ${Math.round(h / 24)}d`
-}
-
-/** A text progress bar of `width` cells. */
-export const bar = (pct: number, width: number): string => {
-  const w = Math.max(1, width)
-  const filled = Math.round((Math.min(100, Math.max(0, pct)) / 100) * w)
-  return '█'.repeat(filled) + '░'.repeat(w - filled)
-}
-
-/** A sparkline of block characters, one per value, scaled to the max. */
-export const sparkline = (values: number[]): string => {
-  const glyphs = '▁▂▃▄▅▆▇█'
-  const max = Math.max(1, ...values)
-  return values
-    .map(v => glyphs[Math.min(7, Math.round((v / max) * 7))] ?? '▁')
-    .join('')
 }
 
 // ---------------------------------------------------------------------------
@@ -219,24 +201,6 @@ export function rateTurn(seconds: number, errors: number, reason: string): Ratin
   return 'good'
 }
 
-export function achievements(t: Totals, turns: TurnRec[], files: Record<string, FileStat>): string[] {
-  const out: string[] = []
-  const reads = (t.byTool.Read ?? 0) + (t.byTool.Grep ?? 0) + (t.byTool.Glob ?? 0)
-  if (t.calls >= 1) out.push('First call')
-  if (t.calls >= 100) out.push('Centurion · 100 tool calls')
-  if (t.calls >= 500) out.push('Machine · 500 tool calls')
-  if (Object.keys(files).length >= 5) out.push('Editor · 5 files touched')
-  if (t.biggestEdit >= 100) out.push('Big refactor · 100+ line edit')
-  if (t.testsPassed >= 1) out.push('Green · tests passed')
-  if (t.testsFailed >= 1 && t.testsPassed >= 1) out.push('Comeback · failed then passed')
-  if (t.bestStreak >= 5) out.push('Streak 5 · clean turns')
-  if (t.bestStreak >= 10) out.push('Streak 10 · clean turns')
-  if (turns.some(x => x.seconds >= 300)) out.push('Marathon · a 5-minute turn')
-  if (reads >= 50) out.push('Explorer · 50 reads and searches')
-  if (turns.length >= 25) out.push('Long session · 25 turns')
-  return out
-}
-
 // ---------------------------------------------------------------------------
 // Skins: icon sets
 // ---------------------------------------------------------------------------
@@ -323,14 +287,13 @@ export const toolIcon = (skin: Skin, tool: string): string => skin.tool[tool] ??
 // ---------------------------------------------------------------------------
 
 export const TIPS: string[] = [
-  'ctrl+x tab focuses the panel, 1–7 switch its tabs',
+  'alt+s moves into the panel, 1–6 or a/d switch its tabs',
   'ctrl+o shows the full transcript behind the compact rows',
-  '/better-ui reopens the panel',
-  'Esc returns from the panel to the prompt',
-  'Tab walks the panel buttons, Enter presses one',
-  '/tui fullscreen docks the panel as a sidebar',
-  'Settings tab: skins, compact rows, alarm',
+  '/better-ui shows or minimizes the panel',
+  'esc returns from the panel to the prompt',
+  'Control tab: pin the commands you use most',
   'History tab: click a turn to jump to its prompt',
+  'Control → colors: presets for terminals that show colors badly',
 ]
 
 /** Color runs over the draft: `@file` references, a leading `/command`, and `code` spans. */
@@ -348,51 +311,6 @@ export function decoratePrompt(text: string): PromptDecoration[] {
     out.push({ start: m.index, end: m.index + m[0].length, color: 'warning' })
   }
   return out
-}
-
-// ---------------------------------------------------------------------------
-// Raster packing (a grid of colored cells)
-// ---------------------------------------------------------------------------
-
-const DEFAULT_COLOR = 0x01000000
-
-/** Packs rows of [character, 0xRRGGBB] into the base64 a `Raster` takes. */
-export function packCells(rows: [string, number][][]): string {
-  const cells = rows.flat()
-  const bytes = new Uint8Array(cells.length * 12)
-  const view = new DataView(bytes.buffer)
-  cells.forEach(([ch, color], i) => {
-    view.setUint32(i * 12, ch.codePointAt(0) ?? 0x20, true)
-    view.setUint32(i * 12 + 4, color, true)
-    view.setUint32(i * 12 + 8, DEFAULT_COLOR, true)
-  })
-  return base64(bytes)
-}
-
-const B64 = 'ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/'
-
-function base64(bytes: Uint8Array): string {
-  let out = ''
-  for (let i = 0; i < bytes.length; i += 3) {
-    const a = bytes[i] ?? 0
-    const b = bytes[i + 1]
-    const c = bytes[i + 2]
-    const n = (a << 16) | ((b ?? 0) << 8) | (c ?? 0)
-    out += B64[(n >> 18) & 63]
-    out += B64[(n >> 12) & 63]
-    out += b === undefined ? '=' : B64[(n >> 6) & 63]
-    out += c === undefined ? '=' : B64[n & 63]
-  }
-  return out
-}
-
-/** Green → yellow → red by how often a file was edited. */
-export function heatColor(edits: number, max: number): number {
-  const t = Math.min(1, edits / Math.max(1, max))
-  const r = Math.round(t < 0.5 ? 0x2e + (0xf9 - 0x2e) * (t * 2) : 0xf9 + (0xc6 - 0xf9) * ((t - 0.5) * 2))
-  const g = Math.round(t < 0.5 ? 0x7d + (0xa8 - 0x7d) * (t * 2) : 0xa8 + (0x28 - 0xa8) * ((t - 0.5) * 2))
-  const b = Math.round(t < 0.5 ? 0x32 + (0x25 - 0x32) * (t * 2) : 0x25 + (0x28 - 0x25) * ((t - 0.5) * 2))
-  return (r << 16) | (g << 8) | b
 }
 
 /** A short label for a rate-limit window: known kinds get their usual name, others are prettified. */

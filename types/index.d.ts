@@ -44,7 +44,7 @@ export type Totals = {
 export type Notice = { text: string; command: string | null; at: number }
 
 /** The turn in progress on the main loop. */
-export type Running = { startedAt: number; promptId?: string; costAtStart?: number }
+export type Running = { startedAt: number; promptId?: string }
 
 /** Preferences, also kept in $.store across sessions. */
 export type Prefs = {
@@ -69,13 +69,14 @@ declare module 'claude-code' {
       totals: Shaped<Totals>
       notices: Shaped<Notice[]>
       prompts: Shaped<Record<string, number>>
-      callTimes: Shaped<number[]>
       prefs: Shaped<Prefs>
       running: Running | null
       tick: number
       tab: string
       expandedFile: string | null
       gitDirty: string[] | null
+      /** The session's repo root, forward slashes; null outside a repo. */
+      gitRoot: string | null
       /** The person closed the pane this session: a reload keeps it closed. */
       hidden: boolean
       /** Minimized: the pane is closed and one line above the prompt stands in for it. */

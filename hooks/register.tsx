@@ -10,8 +10,6 @@ import {
   LOCK_BINDINGS,
   TIPS,
   SKINS,
-  achievements,
-  bar,
   clip,
   countPatch,
   decoratePrompt,
@@ -21,14 +19,11 @@ import {
   fmtMs,
   fmtSeconds,
   fmtTokens,
-  fmtUsd,
-  heatColor,
   hhmm,
   labelOf,
   mergeBindings,
   toolKind,
   shortResult,
-  packCells,
   patchToDiff,
   rateTurn,
   rec,
@@ -37,7 +32,6 @@ import {
   riskOf,
   shortPath,
   skinOf,
-  sparkline,
   str,
   toolIcon,
 } from './lib'
@@ -98,15 +92,13 @@ const notices = atom({ plugin: 'better-ui', key: 'notices' } as const, [] as Not
 const prompts = atom({ plugin: 'better-ui', key: 'prompts' } as const, {} as Record<string, number>, {
   shape: 'prompts-1',
 })
-const callTimes = atom({ plugin: 'better-ui', key: 'callTimes' } as const, [] as number[], {
-  shape: 'calltimes-1',
-})
 const prefs = atom({ plugin: 'better-ui', key: 'prefs' } as const, DEFAULT_PREFS, { shape: 'prefs-1' })
 const running = atom({ plugin: 'better-ui', key: 'running' } as const, null as Running | null)
 const tick = atom({ plugin: 'better-ui', key: 'tick' } as const, 0)
 const tab = atom({ plugin: 'better-ui', key: 'tab' } as const, 'Overview')
 const expandedFile = atom({ plugin: 'better-ui', key: 'expandedFile' } as const, null as string | null)
 const gitDirty = atom({ plugin: 'better-ui', key: 'gitDirty' } as const, null as string[] | null)
+const gitRoot = atom({ plugin: 'better-ui', key: 'gitRoot' } as const, null as string | null)
 const hidden = atom({ plugin: 'better-ui', key: 'hidden' } as const, false)
 const mini = atom({ plugin: 'better-ui', key: 'mini' } as const, false)
 const folds = atom({ plugin: 'better-ui', key: 'folds' } as const, {} as Record<string, boolean>)
@@ -125,6 +117,15 @@ const colorEdit = atom({ plugin: 'better-ui', key: 'colorEdit' } as const, null 
  * /remote-control command describes itself as "Disconnect Remote Control"
  * while connected. null when the command is not there (logged out, disabled).
  */
+let rcCache: { at: number; value: boolean | null } = { at: -Infinity, value: null }
+/** rcLive, reused for 3 s: the hint line redraws on every keystroke. */
+async function rcCached($: CoreEngineInterface): Promise<boolean | null> {
+  const now = await $.clock.now()
+  if (now - rcCache.at < 3000) return rcCache.value
+  rcCache = { at: now, value: await rcLive($) }
+  return rcCache.value
+}
+
 async function rcLive($: CoreEngineInterface): Promise<boolean | null> {
   try {
     const cmd = (await $.command.list()).find(c => c.name === 'remote-control')
@@ -363,10 +364,13 @@ async function refreshGit($: CoreEngineInterface): Promise<void> {
     const ran = await $.process.run(['git', 'status', '--porcelain', '--untracked-files=all'], {
       timeoutMs: 8000,
     })
-    if (ran.exitCode !== 0) {
+    const top = await $.process.run(['git', 'rev-parse', '--show-toplevel'], { timeoutMs: 8000 })
+    if (ran.exitCode !== 0 || top.exitCode !== 0) {
       await update($, gitDirty, () => null)
+      await update($, gitRoot, () => null)
       return
     }
+    await update($, gitRoot, () => top.stdout.trim().replace(/\\/g, '/'))
     const paths = ran.stdout
       .split('\n')
       .filter(l => l.length > 3)
@@ -374,13 +378,22 @@ async function refreshGit($: CoreEngineInterface): Promise<void> {
     await update($, gitDirty, () => paths)
   } catch {
     await update($, gitDirty, () => null)
+    await update($, gitRoot, () => null)
   }
 }
 
-const isDirty = (dirty: string[] | null, path: string): boolean | undefined => {
-  if (dirty === null) return undefined
-  const p = path.replace(/\\/g, '/')
-  return dirty.some(d => p.endsWith('/' + d) || p === d)
+/**
+ * true: changed and not committed; false: committed; undefined: not in the
+ * session's repo (or no repo). Paths compare whole, from the repo root, and
+ * without case, as Windows paths do.
+ */
+const isDirty = (dirty: string[] | null, root: string | null, path: string): boolean | undefined => {
+  if (dirty === null || root === null) return undefined
+  const p = path.replace(/\\/g, '/').toLowerCase()
+  const base = root.replace(/\/+$/, '').toLowerCase() + '/'
+  if (!p.startsWith(base)) return undefined
+  const rel = p.slice(base.length)
+  return dirty.some(d => d.toLowerCase() === rel)
 }
 
 // ---------------------------------------------------------------------------
@@ -601,16 +614,14 @@ export const register: Register = on => {
   on('ui.render', { component: 'AbovePrompt' }, async ($, e, next) => {
     if (e.props.hasSurvey || !(await read($, mini))) return next(e)
     const { Box, Text, Button } = $.ui.resolve(e)
-    const [p, run, turnList, noteList, pct, liveAgents, roster] = await Promise.all([
+    const [p, run, turnList, noteList, pct, liveAgents] = await Promise.all([
       read($, prefs),
       read($, running),
       read($, turns),
       read($, notices),
       contextPercent($),
       liveAgentCount($),
-      rcLive($),
     ])
-    const remote = roster === true
     const skin = skinOf(p.skin)
     const now = await $.clock.now()
     const pctColor = pct === null ? 'subtle' : pct >= 85 ? 'error' : pct >= 60 ? 'warning' : 'success'
@@ -629,7 +640,6 @@ export const register: Register = on => {
           <Text color={liveAgents > 0 ? 'warning' : 'subtle'}>
             · {liveAgents} {liveAgents === 1 ? 'agent' : 'agents'}
           </Text>
-          {remote && <Text color="cyan_FOR_SUBAGENTS_ONLY">· rc on</Text>}
         </Box>
         <Box flexGrow={1} flexShrink={1} height={1} overflow="hidden">
           {latest !== undefined && (
@@ -703,16 +713,10 @@ export const register: Register = on => {
     toolsThisTurn = 0
     errorsThisTurn = 0
     replyLinesThisTurn = 0
-    let costAtStart: number | undefined
-    try {
-      costAtStart = (await $.session.usage()).cost?.usd
-    } catch {
-      costAtStart = undefined
-    }
-    await update($, running, () => ({ startedAt: now, promptId: pendingPromptId, costAtStart }))
+    await update($, running, () => ({ startedAt: now, promptId: pendingPromptId }))
     pendingPromptId = undefined
     ticker?.cancel()
-    ticker = $.clock.every(250, () => void update($, tick, n => (n + 1) % 1_000_000))
+    ticker = $.clock.every(500, () => void update($, tick, n => (n + 1) % 1_000_000))
     return next(e)
   }).catch(($, e, next) => next(e))
 
@@ -742,13 +746,6 @@ export const register: Register = on => {
       u === undefined
         ? 0
         : u.output_tokens
-    let usd: number | undefined
-    try {
-      const after = (await $.session.usage()).cost?.usd
-      if (after !== undefined && run?.costAtStart !== undefined) usd = Math.max(0, after - run.costAtStart)
-    } catch {
-      usd = undefined
-    }
 
     const list = await read($, turns)
     const n = (list[list.length - 1]?.n ?? 0) + 1
@@ -758,7 +755,6 @@ export const register: Register = on => {
       tools,
       errors,
       tokens,
-      usd,
       reason: e.reason,
       promptId: run?.promptId,
       prompt: lastPromptText === '' ? undefined : lastPromptText,
@@ -809,12 +805,6 @@ export const register: Register = on => {
     toolsThisTurn += 1
 
     await update($, activity, list => [...list, entry].slice(-60))
-    await update($, callTimes, list => [...list, startedAt].slice(-2000))
-    await update($, totals, t => ({
-      ...t,
-      calls: t.calls + 1,
-      byTool: { ...t.byTool, [e.tool]: (t.byTool[e.tool] ?? 0) + 1 },
-    }))
 
     const ran = await next(e)
 
@@ -824,14 +814,20 @@ export const register: Register = on => {
     await update($, activity, list => list.map(a => (a.id === id ? { ...a, status, ms } : a)))
     if (isError) {
       errorsThisTurn += 1
-      await update($, totals, t => ({ ...t, errors: t.errors + 1 }))
     }
 
     if (!isError && EDIT_TOOLS.has(e.tool)) {
       const input = rec(e)
       const path = str(input.file_path) ?? str(input.notebook_path)
-      const patch = countPatch(ran.result)
-      const diff = patchToDiff(ran.result)
+      const created = e.tool === 'Write' ? str(input.content) : undefined
+      const createdLines = created === undefined ? [] : created.replace(/\n$/, '').split('\n')
+      const counted = countPatch(ran.result)
+      const patch = counted ?? (created === undefined ? undefined : { adds: createdLines.length, dels: 0 })
+      const diff =
+        patchToDiff(ran.result) ??
+        (created === undefined
+          ? undefined
+          : [`@@ -0,0 +1,${createdLines.length} @@`, ...createdLines.map(l => '+' + l)].join('\n').slice(0, 6000))
       const changed = (patch?.adds ?? 0) + (patch?.dels ?? 0)
       if (path !== undefined) {
         await update($, files, map => {
@@ -848,7 +844,6 @@ export const register: Register = on => {
         if (changed >= BIG_EDIT_LINES) {
           $.ui.toast(`Big edit: ${changed} lines in ${shortPath(path)}`)
         }
-        await update($, totals, t => ({ ...t, biggestEdit: Math.max(t.biggestEdit, changed) }))
       }
     }
 
@@ -856,11 +851,6 @@ export const register: Register = on => {
       const out = rec(ran.result)
       const tests = detectTests(str(rec(e).command) ?? '', str(out.stdout) ?? '', str(out.stderr) ?? '')
       if (tests !== undefined) {
-        await update($, totals, t => ({
-          ...t,
-          testsPassed: t.testsPassed + tests.passed,
-          testsFailed: t.testsFailed + tests.failed,
-        }))
         $.ui.toast(
           tests.failed > 0
             ? `Tests: ${tests.failed} failed, ${tests.passed} passed`
@@ -906,10 +896,12 @@ export const register: Register = on => {
   }).catch(($, e, next) => next(e))
 
   on('ui.render', { component: 'PromptHint' }, async ($, e, next) => {
-    if (e.props.isDraft || e.props.isWorking || !(await read($, prefs)).tips) return next(e)
-    const count = (await read($, turns)).length
-    const tip = TIPS[count % TIPS.length] ?? ''
-    return next({ ...e, props: { ...e.props, tail: tip } })
+    const [p, rc, count] = await Promise.all([read($, prefs), rcCached($), read($, turns).then(l => l.length)])
+    const parts: string[] = []
+    if (rc === true) parts.push('rc on')
+    if (p.tips && !e.props.isDraft && !e.props.isWorking) parts.push(TIPS[count % TIPS.length] ?? '')
+    if (parts.length === 0) return next(e)
+    return next({ ...e, props: { ...e.props, tail: parts.join(' · ') } })
   })
 
   on('ui.render', { component: 'SessionMode' }, async ($, e, next) => {
@@ -1019,7 +1011,6 @@ export const register: Register = on => {
   // and below sets text apart from tool rows, which stay tight together.
   on('ui.render', { component: 'AssistantMessage' }, async ($, e, next) => {
     if (e.props.isSummary === true) return next(e)
-    const p = await read($, prefs)
     const { Box, Text, Markdown } = $.ui.resolve(e)
     return (
       <Box flexDirection="column" marginTop={1} marginBottom={1} width="100%">
@@ -1117,7 +1108,7 @@ export const register: Register = on => {
     const { Box, Text, Button, Code, Input } = $.ui.resolve(e)
     const cols = Math.max(24, e.props.bodyColumns)
     const now = await $.clock.now()
-    const [p, current, fileMap, turnList, noteList, run, dirty, expanded, fold, rc] = await Promise.all([
+    const [p, current, fileMap, turnList, noteList, run, dirty, expanded, fold, root] = await Promise.all([
       read($, prefs),
       read($, tab),
       read($, files),
@@ -1127,7 +1118,7 @@ export const register: Register = on => {
       read($, gitDirty),
       read($, expandedFile),
       read($, folds),
-      rcLive($),
+      read($, gitRoot),
     ])
     const accent = 'pink_FOR_SUBAGENTS_ONLY'
     const active = (TABS as readonly string[]).includes(current) ? (current as Tab) : 'Overview'
@@ -1216,13 +1207,6 @@ export const register: Register = on => {
               {active}
             </Text>
           </Box>
-          {rc === true && (
-            <Box flexShrink={0}>
-              <Text color="cyan_FOR_SUBAGENTS_ONLY" bold>
-                rc on
-              </Text>
-            </Box>
-          )}
           <Box flexGrow={1} />
           {TABS.map(name => (
             <Button key={`dot:${name}`} plain onPress={() => go(name)}>
@@ -1260,12 +1244,15 @@ export const register: Register = on => {
     switch (active) {
       case 'Overview': {
         const [pct, liveAgents] = await Promise.all([contextPercent($), liveAgentCount($)])
+        // While a turn runs, redraw with the clock so "working 0:42" keeps counting.
+        if (run !== null) await read($, tick)
         const elapsed = run === null ? 0 : Math.max(0, Math.round((now - run.startedAt) / 1000))
         const last = turnList[turnList.length - 1]
         const turnNo = run !== null ? turnList.length + 1 : (last?.n ?? 0)
         const idleFor = last === undefined ? undefined : Math.max(0, Math.round((now - last.at) / 1000))
         const notesOpen = isOpen('notices')
-        const shown = notesOpen ? [...noteList].reverse() : noteList.slice(-3).reverse()
+        const NOTES_SHOWN = 3
+        const shown = notesOpen ? [...noteList].reverse() : noteList.slice(-NOTES_SHOWN).reverse()
         const more = noteList.length - shown.length
         const result =
           last === undefined
@@ -1330,7 +1317,7 @@ export const register: Register = on => {
               )}
             </Box>
             <Box flexDirection="column">
-              {noteList.length > 3
+              {noteList.length > NOTES_SHOWN
                 ? foldSection('notices', 'notices', String(noteList.length))
                 : section('notices', String(noteList.length))}
               {noteList.length === 0 && <Text color="inactive">Nothing from Claude Code yet.</Text>}
@@ -1340,7 +1327,7 @@ export const register: Register = on => {
                     <Text color="inactive">{hhmm(nt.at)}</Text>
                   </Box>
                   <Box flexGrow={1} flexShrink={1} flexDirection="column">
-                    <Text wrap={notesOpen ? 'wrap' : 'truncate-end'}>{nt.text}</Text>
+                    <Text wrap="wrap">{nt.text}</Text>
                   </Box>
                   {nt.command !== null && (
                     <Box flexShrink={0}>
@@ -1568,7 +1555,7 @@ export const register: Register = on => {
             <Box flexDirection="column">
               {rows.length === 0 && <Text color="inactive">No edits yet.</Text>}
               {rows.map(([path, f]) => {
-                const d = isDirty(dirty, path)
+                const d = isDirty(dirty, root, path)
                 const isOpenFile = expanded === path
                 const total = f.adds + f.dels
                 const cells = Math.max(1, Math.round((total / biggest) * BARS))
@@ -1581,7 +1568,7 @@ export const register: Register = on => {
                     onPress={() => update($, expandedFile, cur => (cur === path ? null : path))}
                   >
                     <Text color={d === true ? 'warning' : 'inactive'}>{d === true ? '● ' : '· '}</Text>
-                    <Text bold={isOpenFile} color={d === false ? 'inactive' : 'text'}>
+                    <Text bold={isOpenFile} color={d === true ? 'text' : 'inactive'}>
                       {name}{' '}
                     </Text>
                     <Text>
@@ -1602,7 +1589,7 @@ export const register: Register = on => {
                 {openFile.diff !== undefined ? (
                   <Code format="diff" source={openFile.diff} path={expanded} wrap="truncate-end" />
                 ) : (
-                  <Text color="inactive">No diff was recorded for the last edit.</Text>
+                  <Text color="inactive">No preview of this edit: it was made before Better UI recorded previews.</Text>
                 )}
               </Box>
             )}
@@ -1947,7 +1934,6 @@ export const register: Register = on => {
                         await update($, turns, () => [])
                         await update($, totals, () => EMPTY_TOTALS)
                         await update($, notices, () => [])
-                        await update($, callTimes, () => [])
                         await update($, expandedFile, () => null)
                         $.ui.toast('Counters, files and history reset')
                       }}
