@@ -238,7 +238,7 @@ export function achievements(t: Totals, turns: TurnRec[], files: Record<string, 
 }
 
 // ---------------------------------------------------------------------------
-// Skins: icon sets picked in Settings
+// Skins: icon sets
 // ---------------------------------------------------------------------------
 
 export type Skin = {

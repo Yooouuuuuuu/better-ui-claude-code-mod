@@ -56,7 +56,7 @@ const BIG_EDIT_LINES = 100
 const USER_TINT = 'userMessageBackground'
 const USER_ACCENT = 'briefLabelYou'
 const USER_RULE = 'subtle'
-const TABS = ['Overview', 'Usage', 'History', 'Agents', 'Files', 'Settings'] as const
+const TABS = ['Overview', 'Usage', 'History', 'Agents', 'Files', 'Control'] as const
 type Tab = (typeof TABS)[number]
 
 const DEFAULT_PREFS: Prefs = {
@@ -68,7 +68,6 @@ const DEFAULT_PREFS: Prefs = {
   skin: 'line',
   hotkey: true,
   lockSize: false,
-  guardTui: true,
 }
 const EMPTY_TOTALS: Totals = {
   calls: 0,
@@ -110,7 +109,16 @@ const expandedFile = atom({ plugin: 'better-ui', key: 'expandedFile' } as const,
 const gitDirty = atom({ plugin: 'better-ui', key: 'gitDirty' } as const, null as string[] | null)
 const hidden = atom({ plugin: 'better-ui', key: 'hidden' } as const, false)
 const mini = atom({ plugin: 'better-ui', key: 'mini' } as const, false)
-const rcState = atom({ plugin: 'better-ui', key: 'rc' } as const, null as boolean | null)
+const folds = atom({ plugin: 'better-ui', key: 'folds' } as const, {} as Record<string, boolean>)
+const pins = atom({ plugin: 'better-ui', key: 'pins' } as const, [] as string[])
+const recent = atom({ plugin: 'better-ui', key: 'recent' } as const, [] as string[])
+const cmdFilter = atom({ plugin: 'better-ui', key: 'cmdFilter' } as const, '')
+const pinEdit = atom({ plugin: 'better-ui', key: 'pinEdit' } as const, false)
+const colorDraft = atom({ plugin: 'better-ui', key: 'colorDraft' } as const, {
+  preset: 'dark',
+  colors: {} as Record<string, string>,
+})
+const colorEdit = atom({ plugin: 'better-ui', key: 'colorEdit' } as const, null as string | null)
 
 /**
  * Whether Remote Control is connected, read from Claude Code itself: its
@@ -126,18 +134,6 @@ async function rcLive($: CoreEngineInterface): Promise<boolean | null> {
   }
 }
 
-/** Turns Remote Control on or off by running Claude Code's own command. */
-async function rcToggle($: CoreEngineInterface): Promise<void> {
-  try {
-    await $.command.run({ command: 'remote-control' })
-  } catch (err) {
-    $.ui.toast(`Remote Control: ${err instanceof Error ? err.message : String(err)}`)
-  }
-  const now = await rcLive($)
-  await update($, rcState, () => now)
-}
-
-/** Closes the pane and shows the one-line band in its place. */
 async function minimize($: CoreEngineInterface): Promise<void> {
   await update($, mini, () => true)
   await update($, hidden, () => false)
@@ -391,11 +387,131 @@ const isDirty = (dirty: string[] | null, path: string): boolean | undefined => {
 // The mod
 // ---------------------------------------------------------------------------
 
+// ---------------------------------------------------------------------------
+// Control tab: commands, pins, recent, colors
+// ---------------------------------------------------------------------------
+
+const DEFAULT_PINS = ['remote-control', 'compact', 'context', 'rewind', 'resume', 'add-dir']
+const RECENT_MAX = 5
+const DEFAULT_FOLDS: Record<string, boolean> = {
+  pinned: true,
+  recent: true,
+  all: false,
+  'all:skills': false,
+  'all:mcp': false,
+  colors: false,
+  prefs: false,
+}
+
+/** Built-in commands sorted into the panel's groups; any other built-in lands in "other". */
+const COMMAND_GROUPS: readonly (readonly [string, readonly string[]])[] = [
+  ['session', ['compact', 'clear', 'resume', 'rewind', 'export', 'rename', 'exit']],
+  ['model & context', ['model', 'context', 'usage', 'cost', 'effort', 'fast', 'status']],
+  ['project', ['add-dir', 'init', 'memory', 'code-review', 'review', 'security-review', 'remote-control']],
+  ['setup', ['config', 'theme', 'permissions', 'mcp', 'agents', 'plugin', 'keybindings', 'hooks', 'statusline', 'ide']],
+]
+
+/** The six colors the Control tab edits, and the theme keys each one sets. */
+const COLOR_KEYS: readonly (readonly [string, string, readonly string[]])[] = [
+  ['text', 'text', ['text']],
+  ['dim', 'dim', ['inactive']],
+  ['accent', 'accent', ['pink_FOR_SUBAGENTS_ONLY', 'briefLabelYou', 'autoAccept']],
+  ['message', 'your message', ['userMessageBackground', 'userMessageBackgroundHover']],
+  ['success', 'success', ['success', 'green_FOR_SUBAGENTS_ONLY', 'bashBorder']],
+  ['error', 'error', ['error', 'red_FOR_SUBAGENTS_ONLY']],
+]
+type ColorDraft = { preset: string; colors: Record<string, string> }
+const COLOR_PRESETS: Record<string, { base: string; colors: Record<string, string> }> = {
+  dark: {
+    base: 'dark',
+    colors: { text: '#f8f8f2', dim: '#7c84b0', accent: '#ff79c6', message: '#3d2f52', success: '#50fa7b', error: '#ff5555' },
+  },
+  light: {
+    base: 'light',
+    colors: { text: '#1e1f29', dim: '#5c6370', accent: '#c4146f', message: '#efe4fb', success: '#1a7f37', error: '#cf222e' },
+  },
+  contrast: {
+    base: 'dark',
+    colors: { text: '#ffffff', dim: '#b8bfe6', accent: '#ff5fd2', message: '#4b2d6e', success: '#5cff8a', error: '#ff4d4d' },
+  },
+  '16-color': {
+    base: 'dark',
+    colors: { text: '#ffffff', dim: '#808080', accent: '#ff00ff', message: '#000080', success: '#00ff00', error: '#ff0000' },
+  },
+}
+const MINE_THEME_FILE = 'better-ui-mine.json'
+const MINE_THEME_NAME = 'Better UI (mine)'
+
+/** "compact keep the tests" -> { command: "compact", args: "keep the tests" } */
+function splitCommandLine(line: string): { command: string; args: string } {
+  const t = line.trim().replace(/^\//, '')
+  const at = t.search(/\s/)
+  return at < 0 ? { command: t, args: '' } : { command: t.slice(0, at), args: t.slice(at + 1).trim() }
+}
+
+async function recordRecent($: CoreEngineInterface, name: string): Promise<void> {
+  if (name === '' || name === 'better-ui') return
+  const list = await update($, recent, l => [name, ...l.filter(x => x !== name)].slice(0, 20))
+  await $.store.set('recent', list)
+}
+
+/** Runs a pinned or listed command line from the panel, as if typed. */
+async function runCommandLine($: CoreEngineInterface, line: string): Promise<void> {
+  const { command, args } = splitCommandLine(line)
+  if (command === '') return
+  try {
+    await $.command.run(args === '' ? { command } : { command, args })
+    await recordRecent($, command)
+  } catch (err) {
+    $.ui.toast(`/${command}: ${err instanceof Error ? err.message : String(err)}`)
+  }
+}
+
+async function setPins($: CoreEngineInterface, change: (l: string[]) => string[]): Promise<void> {
+  const list = await update($, pins, l => change([...l]))
+  await $.store.set('pins', list)
+}
+
+async function setFold($: CoreEngineInterface, key: string, open: boolean): Promise<void> {
+  const map = await update($, folds, m => ({ ...m, [key]: open }))
+  await $.store.set('folds', map)
+}
+
+async function setColors($: CoreEngineInterface, draft: ColorDraft): Promise<void> {
+  await update($, colorDraft, () => draft)
+  await $.store.set('colors', draft)
+}
+
+/** Writes "Better UI (mine)": the bundled theme with the six edited colors laid over it. */
+async function saveMineTheme($: CoreEngineInterface): Promise<void> {
+  try {
+    const draft = await read($, colorDraft)
+    const bundled = rec(JSON.parse(String(await $.fs.read(`${$.plugin.root}/themes/better-ui.json`))))
+    const overrides: Record<string, unknown> = { ...rec(bundled.overrides) }
+    for (const [id, , keys] of COLOR_KEYS) {
+      const hex = draft.colors[id]
+      if (hex !== undefined) for (const k of keys) overrides[k] = hex
+    }
+    const theme = {
+      name: MINE_THEME_NAME,
+      base: COLOR_PRESETS[draft.preset]?.base ?? 'dark',
+      overrides,
+    }
+    const kb = await keybindingsPath($)
+    const dir = kb.slice(0, kb.length - 'keybindings.json'.length) + 'themes'
+    await $.fs.write(`${dir}/${MINE_THEME_FILE}`, JSON.stringify(theme, null, 2) + '\n')
+    $.ui.toast(`Saved "${MINE_THEME_NAME}". Pick it in /theme to use it.`)
+  } catch (err) {
+    $.ui.toast(`Theme not saved: ${err instanceof Error ? err.message : String(err)}`)
+  }
+}
+
 export const register: Register = on => {
   let toolsThisTurn = 0
   let errorsThisTurn = 0
   let pendingPromptId: string | undefined
   let lastPromptText = ''
+  let replyLinesThisTurn = 0
   let ticker: Timer | undefined
   let lastRateWarn = 0
   const seenNotices = new Set<string>()
@@ -418,6 +534,22 @@ export const register: Register = on => {
     if (typeof merged.skin !== 'string' || !(merged.skin in SKINS)) merged.skin = 'line'
     await update($, prefs, () => merged)
     await update($, running, () => null)
+
+    const storedPins = await $.store.get('pins')
+    const storedRecent = await $.store.get('recent')
+    const storedFolds = await $.store.get('folds')
+    const storedColors = rec(await $.store.get('colors'))
+    const strings = (v: unknown) => (Array.isArray(v) ? v.filter((x): x is string => typeof x === 'string') : null)
+    await update($, pins, () => strings(storedPins) ?? [...DEFAULT_PINS])
+    await update($, recent, () => strings(storedRecent) ?? [])
+    await update($, folds, () =>
+      Object.fromEntries(Object.entries(rec(storedFolds)).filter(([, v]) => typeof v === 'boolean')) as Record<string, boolean>,
+    )
+    const preset = typeof storedColors.preset === 'string' && storedColors.preset in COLOR_PRESETS ? storedColors.preset : 'dark'
+    const savedColors = Object.fromEntries(
+      Object.entries(rec(storedColors.colors)).filter(([, v]) => typeof v === 'string' && /^#[0-9a-fA-F]{6}$/.test(v)),
+    ) as Record<string, string>
+    await update($, colorDraft, () => ({ preset, colors: { ...(COLOR_PRESETS[preset]?.colors ?? {}), ...savedColors } }))
 
     void syncBindings($, 'focus', merged.hotkey, false)
     void installThemes($)
@@ -457,16 +589,12 @@ export const register: Register = on => {
     return next(e)
   }).catch(($, e, next) => (next.called ? undefined : next(e)))
 
-  // ---- Remote Control -----------------------------------------------------------
-
-  // However /remote-control is run (typed, /rc, the panel's button), record the
-  // state it leaves, so the panel and the minimized line redraw.
-  on('command.run', { command: 'remote-control' }, async ($, e, next) => {
+  // Every command run, typed or clicked, lands in Control's recent list.
+  on('command.run', async ($, e, next) => {
     const out = await next(e)
-    const state = await rcLive($)
-    await update($, rcState, () => state)
+    void recordRecent($, e.command)
     return out
-  }).catch(($, e, next) => (next.called ? next(e) : next(e)))
+  }).catch(($, e, next) => (next.called ? undefined : next(e)))
 
   // ---- the minimized line above the prompt --------------------------------
 
@@ -483,7 +611,6 @@ export const register: Register = on => {
       rcLive($),
     ])
     const remote = roster === true
-    await read($, rcState)
     const skin = skinOf(p.skin)
     const now = await $.clock.now()
     const pctColor = pct === null ? 'subtle' : pct >= 85 ? 'error' : pct >= 60 ? 'warning' : 'success'
@@ -491,41 +618,33 @@ export const register: Register = on => {
     const turnText = run !== null ? `turn ${turnList.length + 1}` : `turn ${turnList[turnList.length - 1]?.n ?? 0}`
     const latest = noteList[noteList.length - 1]
     return (
-      <Box flexDirection="row" gap={1}>
-        <Text color={run === null ? 'success' : 'warning'}>{run === null ? skin.ok : skin.run}</Text>
-        <Text bold>{run === null ? 'idle' : `working ${fmtSeconds(elapsed)}`}</Text>
-        <Text dimColor>·</Text>
-        <Text dimColor>context</Text>
-        <Text color={pctColor}>{pct === null ? '—' : `${pct}%`}</Text>
-        <Text dimColor>· {turnText}</Text>
-        <Text color={liveAgents > 0 ? 'warning' : 'subtle'}>
-          · {liveAgents} {liveAgents === 1 ? 'agent' : 'agents'}
-        </Text>
-        {remote && <Text color="cyan_FOR_SUBAGENTS_ONLY">· rc on</Text>}
-        {latest !== undefined && (
-          <Text dimColor wrap="truncate-end">
-            · {latest.text}
+      <Box flexDirection="row" gap={1} width="100%">
+        <Box flexShrink={0} flexDirection="row" gap={1}>
+          <Text color={run === null ? 'success' : 'warning'}>{run === null ? skin.ok : skin.run}</Text>
+          <Text bold>{run === null ? 'idle' : `working ${fmtSeconds(elapsed)}`}</Text>
+          <Text dimColor>·</Text>
+          <Text dimColor>context</Text>
+          <Text color={pctColor}>{pct === null ? '—' : `${pct}%`}</Text>
+          <Text dimColor>· {turnText}</Text>
+          <Text color={liveAgents > 0 ? 'warning' : 'subtle'}>
+            · {liveAgents} {liveAgents === 1 ? 'agent' : 'agents'}
           </Text>
-        )}
-        <Button key="expand" label="open" onPress={() => void expand($)} />
+          {remote && <Text color="cyan_FOR_SUBAGENTS_ONLY">· rc on</Text>}
+        </Box>
+        <Box flexGrow={1} flexShrink={1} height={1} overflow="hidden">
+          {latest !== undefined && (
+            <Text dimColor wrap="truncate-end">
+              · {latest.text}
+            </Text>
+          )}
+        </Box>
+        <Box flexShrink={0}>
+          <Button key="expand" label="open" onPress={() => void expand($)} />
+        </Box>
       </Box>
     )
   })
 
-  // /tui restarts the renderer through a fresh session id, which drops the
-  // session's dev-mods folder: the pane and /better-ui vanish. Answer it here.
-  on('command.run', { command: 'tui' }, async ($, e, next) => {
-    const p = await read($, prefs)
-    if (!p.guardTui) return next(e)
-    const current = e.presentation.isFullscreen ? 'fullscreen' : 'default'
-    const wanted = e.args.trim()
-    if (wanted === '' || wanted === current) {
-      return { text: `Current renderer: ${current}. (/tui is guarded by Better UI: it would restart the session and unload this mod. Turn the guard off in Settings to run it.)` }
-    }
-    return {
-      text: `Not switching to "${wanted}": /tui restarts the session under a new id, which unloads Better UI. To switch, turn the guard off in Better UI's Settings and run /tui again, or set "tui" in settings.json and start a new session.`,
-    }
-  }).catch(($, e, next) => (next.called ? next(e) : { text: 'Better UI could not guard /tui.' }))
 
 
   on('session.append', { door: 'prompt' }, async ($, e, next) => {
@@ -547,6 +666,18 @@ export const register: Register = on => {
     }
     return next(e)
   }).catch(($, e, next) => next(e))
+
+  on('session.append', { door: 'response' }, async ($, e, next) => {
+    if (e.agentId === undefined) {
+      const text = e.message.content
+        .filter(b => b.type === 'text')
+        .map(b => str(rec(b).text) ?? '')
+        .join('\n')
+        .trim()
+      if (text !== '') replyLinesThisTurn += text.split('\n').length
+    }
+    return next(e)
+  }).catch(($, e, next) => (next.called ? undefined : next(e)))
 
   on('session.append', { door: 'notice' }, async ($, e, next) => {
     if (e.agentId === undefined) {
@@ -571,6 +702,7 @@ export const register: Register = on => {
     const now = await $.clock.now()
     toolsThisTurn = 0
     errorsThisTurn = 0
+    replyLinesThisTurn = 0
     let costAtStart: number | undefined
     try {
       costAtStart = (await $.session.usage()).cost?.usd
@@ -630,6 +762,7 @@ export const register: Register = on => {
       reason: e.reason,
       promptId: run?.promptId,
       prompt: lastPromptText === '' ? undefined : lastPromptText,
+      replyLines: replyLinesThisTurn === 0 ? undefined : replyLinesThisTurn,
       at: now,
     }
     await update($, turns, l => [...l, record].slice(-100))
@@ -776,7 +909,7 @@ export const register: Register = on => {
     if (e.props.isDraft || e.props.isWorking || !(await read($, prefs)).tips) return next(e)
     const count = (await read($, turns)).length
     const tip = TIPS[count % TIPS.length] ?? ''
-    return next({ ...e, props: { ...e.props, tail: ` · ${tip}` } })
+    return next({ ...e, props: { ...e.props, tail: tip } })
   })
 
   on('ui.render', { component: 'SessionMode' }, async ($, e, next) => {
@@ -843,51 +976,13 @@ export const register: Register = on => {
   })
 
   // When a turn ends: a rule that closes the reply and carries its result.
+  // The turn's figures live in Overview's "last turn": the transcript keeps no
+  // turn line. Expanded views and "waiting for" lines pass through.
   on('ui.render', { component: 'TurnDuration' }, async ($, e, next) => {
     if (e.props.isExpanded === true || e.props.waitingFor !== undefined) return next(e)
-    const list = await read($, turns)
-    const t = list[list.length - 1]
-    if (t === undefined || Math.abs(t.seconds * 1000 - e.props.durationMs) > 2500) return next(e)
-    const p = await read($, prefs)
-    const { Box, Text } = $.ui.resolve(e)
-    const rating = rateTurn(t.seconds, t.errors, t.reason)
-    const outcome =
-      t.reason === 'aborted' ? { mark: '■ stopped', tone: 'warning' }
-      : t.reason === 'error' ? { mark: '× error', tone: 'error' }
-      : t.reason === 'refusal' ? { mark: '× refused', tone: 'error' }
-      : { mark: 'done', tone: rating === 'slow' ? 'warning' : 'success' }
-    const ruleTone = outcome.tone
-    return (
-      <Box flexDirection="row" columnGap={1} marginTop={1}>
-        <Text color={ruleTone} dimColor>
-          ──
-        </Text>
-        <Box flexShrink={0}>
-          <Text color={outcome.tone} bold>
-            {outcome.mark}
-          </Text>
-        </Box>
-        <Box flexShrink={0}>
-          <Text color="inactive">
-            in {fmtSeconds(t.seconds)} · {t.tools} {t.tools === 1 ? 'tool' : 'tools'}
-            {t.errors > 0 && <Text color="error"> · {t.errors} failed</Text>} · ↓ {fmtTokens(t.tokens)} tok
-          </Text>
-        </Box>
-        {t.reason === 'answer' && rating === 'fast' && (
-          <Box flexShrink={0}>
-            <Text color="yellow_FOR_SUBAGENTS_ONLY">» fast</Text>
-          </Box>
-        )}
-        <Box flexGrow={1} flexShrink={1} height={1} overflow="hidden">
-          <Text color={ruleTone} dimColor wrap="wrap">
-            {'─'.repeat(400)}
-          </Text>
-        </Box>
-      </Box>
-    )
+    const { Box } = $.ui.resolve(e)
+    return <Box />
   })
-
-  // ---- transcript rows -----------------------------------------------------
 
   on('ui.render', { component: 'UserMessage' }, async ($, e, next) => {
     if (e.props.origin.kind !== 'composer') return next(e)
@@ -926,8 +1021,6 @@ export const register: Register = on => {
     if (e.props.isSummary === true) return next(e)
     const p = await read($, prefs)
     const { Box, Text, Markdown } = $.ui.resolve(e)
-    const long = e.props.text.length >= 1200
-    const lines = e.props.text.split('\n').length
     return (
       <Box flexDirection="column" marginTop={1} marginBottom={1} width="100%">
         {e.props.isFirstOfReply && (
@@ -944,12 +1037,6 @@ export const register: Register = on => {
         )}
         <Box paddingLeft={2} flexDirection="column" width="100%" flexShrink={1}>
           <Markdown text={e.props.text} />
-          {long && (
-            <Text color="inactive">
-              <Text color="permission">◇ </Text>
-              {lines} lines · ~{fmtTokens(Math.round(e.props.text.length / 4))} tok
-            </Text>
-          )}
         </Box>
       </Box>
     )
@@ -1027,10 +1114,10 @@ export const register: Register = on => {
   // ---- the pane ------------------------------------------------------------
 
   on('ui.render', { component: 'Pane', requestId: PANE }, async ($, e) => {
-    const { Box, Text, Button, Code } = $.ui.resolve(e)
+    const { Box, Text, Button, Code, Input } = $.ui.resolve(e)
     const cols = Math.max(24, e.props.bodyColumns)
     const now = await $.clock.now()
-    const [p, current, fileMap, turnList, noteList, run, dirty, expanded] = await Promise.all([
+    const [p, current, fileMap, turnList, noteList, run, dirty, expanded, fold, rc] = await Promise.all([
       read($, prefs),
       read($, tab),
       read($, files),
@@ -1039,13 +1126,15 @@ export const register: Register = on => {
       read($, running),
       read($, gitDirty),
       read($, expandedFile),
+      read($, folds),
+      rcLive($),
     ])
-    const c = true
-    const accent = c ? 'pink_FOR_SUBAGENTS_ONLY' : 'claude'
+    const accent = 'pink_FOR_SUBAGENTS_ONLY'
     const active = (TABS as readonly string[]).includes(current) ? (current as Tab) : 'Overview'
     const at = TABS.indexOf(active)
     const go = (name: Tab) => update($, tab, () => name)
     const step = (by: number) => go(TABS[(at + by + TABS.length) % TABS.length] ?? 'Overview')
+    const isOpen = (key: string) => fold[key] ?? DEFAULT_FOLDS[key] ?? false
 
     // ---- shared pieces
     const rule = (color = 'subtle') => (
@@ -1055,19 +1144,39 @@ export const register: Register = on => {
         </Text>
       </Box>
     )
+    // Section titles: bold capitals over an accent rule.
     const section = (label: string, right?: string) => (
-      <Box flexDirection="row" columnGap={1}>
-        <Box flexShrink={0}>
-          <Text color="inactive">{label}</Text>
-        </Box>
-        {rule()}
-        {right !== undefined && (
+      <Box flexDirection="column">
+        <Box flexDirection="row" columnGap={1}>
           <Box flexShrink={0}>
-            <Text color="inactive">{right}</Text>
+            <Text bold>{label.toUpperCase()}</Text>
           </Box>
-        )}
+          <Box flexGrow={1} />
+          {right !== undefined && (
+            <Box flexShrink={0}>
+              <Text color="inactive">{right}</Text>
+            </Box>
+          )}
+        </Box>
+        <Box flexDirection="row">{rule(accent)}</Box>
       </Box>
     )
+    // A section that folds: + closed, − open; the whole title row toggles it.
+    const foldSection = (key: string, label: string, right?: string) => {
+      const open = isOpen(key)
+      return (
+        <Box flexDirection="column">
+          <Button key={`fold:${key}`} plain onPress={() => void setFold($, key, !open)}>
+            <Text color={accent} bold>
+              {open ? '− ' : '+ '}
+            </Text>
+            <Text bold>{label.toUpperCase()}</Text>
+            {right !== undefined && <Text color="inactive">{`  ${right}`}</Text>}
+          </Button>
+          <Box flexDirection="row">{rule(open ? accent : 'subtle')}</Box>
+        </Box>
+      )
+    }
     const LABEL = 9
     const meter = (pct: number, tone: string) => {
       const w = Math.max(6, cols - LABEL - 6)
@@ -1094,19 +1203,26 @@ export const register: Register = on => {
         )}
       </Box>
     )
-    const levelTone = (pct: number) =>
-      pct >= 90 ? 'error' : pct >= 70 ? 'warning' : c ? 'success' : 'inactive'
+    const levelTone = (pct: number) => (pct >= 90 ? 'error' : pct >= 70 ? 'warning' : 'success')
     const clock = (secs: number) => `${Math.floor(secs / 60)}:${String(secs % 60).padStart(2, '0')}`
+    const mins = (secs: number) => (secs < 60 ? '<1m' : `${Math.round(secs / 60)}m`)
 
-    // ---- top bar: the tab's name, then one dot per tab (clickable)
+    // ---- top bar: the tab's name, rc while on, then one dot per tab (clickable)
     const header = (
       <Box flexDirection="column">
         <Box flexDirection="row" columnGap={1}>
           <Box flexShrink={0}>
-            <Text color={c ? accent : 'text'} bold>
+            <Text color={accent} bold>
               {active}
             </Text>
           </Box>
+          {rc === true && (
+            <Box flexShrink={0}>
+              <Text color="cyan_FOR_SUBAGENTS_ONLY" bold>
+                rc on
+              </Text>
+            </Box>
+          )}
           <Box flexGrow={1} />
           {TABS.map(name => (
             <Button key={`dot:${name}`} plain onPress={() => go(name)}>
@@ -1143,18 +1259,44 @@ export const register: Register = on => {
     let body
     switch (active) {
       case 'Overview': {
-        const [pct, liveAgents, rc] = await Promise.all([contextPercent($), liveAgentCount($), rcLive($)])
-        await read($, rcState)
+        const [pct, liveAgents] = await Promise.all([contextPercent($), liveAgentCount($)])
         const elapsed = run === null ? 0 : Math.max(0, Math.round((now - run.startedAt) / 1000))
-        const turnNo = run !== null ? turnList.length + 1 : (turnList[turnList.length - 1]?.n ?? 0)
+        const last = turnList[turnList.length - 1]
+        const turnNo = run !== null ? turnList.length + 1 : (last?.n ?? 0)
+        const idleFor = last === undefined ? undefined : Math.max(0, Math.round((now - last.at) / 1000))
+        const notesOpen = isOpen('notices')
+        const shown = notesOpen ? [...noteList].reverse() : noteList.slice(-3).reverse()
+        const more = noteList.length - shown.length
+        const result =
+          last === undefined
+            ? null
+            : last.reason === 'aborted'
+              ? { text: `■ stopped after ${fmtSeconds(last.seconds)}`, tone: 'warning' }
+              : last.reason === 'error' || last.reason === 'refusal'
+                ? { text: `× ${last.reason} after ${fmtSeconds(last.seconds)}`, tone: 'error' }
+                : { text: `done in ${fmtSeconds(last.seconds)}`, tone: 'success' }
         body = (
           <Box flexDirection="column" rowGap={1}>
             <Box flexDirection="column">
-              <Box flexDirection="row" columnGap={1}>
-                <Text color={run === null ? 'success' : 'warning'}>●</Text>
-                <Text bold>{run === null ? 'idle' : 'working'}</Text>
-                {run !== null && <Text color={c ? 'yellow_FOR_SUBAGENTS_ONLY' : 'inactive'}>{clock(elapsed)}</Text>}
-              </Box>
+              {section('now')}
+              {field(
+                'state',
+                run === null ? (
+                  <Text>
+                    <Text color="success" bold>
+                      idle
+                    </Text>
+                    {idleFor !== undefined && <Text color="inactive"> for {mins(idleFor)}</Text>}
+                  </Text>
+                ) : (
+                  <Text>
+                    <Text color="warning" bold>
+                      working
+                    </Text>
+                    <Text color="warning"> {clock(elapsed)}</Text>
+                  </Text>
+                ),
+              )}
               {field(
                 'context',
                 pct === null ? '—' : meter(pct, levelTone(pct)),
@@ -1163,44 +1305,59 @@ export const register: Register = on => {
               {field('turn', String(turnNo))}
               {field(
                 'agents',
-                <Text color={liveAgents > 0 ? (c ? 'purple_FOR_SUBAGENTS_ONLY' : 'text') : 'inactive'}>
-                  {liveAgents > 0 ? `${liveAgents} running` : 'none running'}
+                <Text color={liveAgents > 0 ? 'purple_FOR_SUBAGENTS_ONLY' : 'inactive'}>
+                  {liveAgents > 0 ? `${liveAgents} running` : 'none'}
                 </Text>,
               )}
             </Box>
             <Box flexDirection="column">
-              {section('remote control')}
-              {rc === null ? (
-                <Text color="inactive">not available here</Text>
+              {section('last turn', last === undefined ? undefined : `turn ${last.n}`)}
+              {last === undefined || result === null ? (
+                <Text color="inactive">No turns finished yet.</Text>
               ) : (
-                <Button key="rc" plain onPress={() => void rcToggle($)}>
-                  <Text color={rc ? 'cyan_FOR_SUBAGENTS_ONLY' : 'inactive'} inverse={rc} bold={rc}>
-                    {' on '}
-                  </Text>
-                  <Text color={rc ? 'inactive' : 'text'} inverse={!rc} bold={!rc}>
-                    {' off '}
-                  </Text>
-                  <Text color="inactive">{rc ? '  click to disconnect' : '  click to connect'}</Text>
-                </Button>
+                <Box flexDirection="column">
+                  {field('result', <Text color={result.tone}>{result.text}</Text>)}
+                  {field(
+                    'tools',
+                    <Text>
+                      {last.tools}
+                      {last.errors > 0 && <Text color="error"> · {last.errors} failed</Text>}
+                    </Text>,
+                  )}
+                  {field('written', `↓ ${fmtTokens(last.tokens)} tok`)}
+                  {field('reply', last.replyLines === undefined ? '—' : `${last.replyLines} lines`)}
+                </Box>
               )}
             </Box>
             <Box flexDirection="column">
-              {section('notices', String(noteList.length))}
-              {noteList.length === 0 && <Text color="inactive">Nothing from the engine yet.</Text>}
-              {noteList
-                .slice(-8)
-                .reverse()
-                .map((nt, i) => (
-                  <Box key={`note:${i}`} flexDirection="row" columnGap={1}>
-                    <Box width={5} flexShrink={0}>
-                      <Text color="inactive">{hhmm(nt.at)}</Text>
-                    </Box>
-                    <Box flexGrow={1} flexShrink={1}>
-                      <Text wrap="truncate-end">{nt.text}</Text>
-                    </Box>
-                    {nt.command !== null && <Text color={c ? 'cyan_FOR_SUBAGENTS_ONLY' : 'inactive'}>{nt.command}</Text>}
+              {noteList.length > 3
+                ? foldSection('notices', 'notices', String(noteList.length))
+                : section('notices', String(noteList.length))}
+              {noteList.length === 0 && <Text color="inactive">Nothing from Claude Code yet.</Text>}
+              {shown.map((nt, i) => (
+                <Box key={`note:${i}`} flexDirection="row" columnGap={1}>
+                  <Box width={5} flexShrink={0}>
+                    <Text color="inactive">{hhmm(nt.at)}</Text>
                   </Box>
-                ))}
+                  <Box flexGrow={1} flexShrink={1} flexDirection="column">
+                    <Text wrap={notesOpen ? 'wrap' : 'truncate-end'}>{nt.text}</Text>
+                  </Box>
+                  {nt.command !== null && (
+                    <Box flexShrink={0}>
+                      <Button key={`notecmd:${i}`} plain onPress={() => void runCommandLine($, nt.command ?? '')}>
+                        <Text color="cyan_FOR_SUBAGENTS_ONLY">{nt.command}</Text>
+                      </Button>
+                    </Box>
+                  )}
+                </Box>
+              ))}
+              {!notesOpen && more > 0 && (
+                <Box paddingLeft={6}>
+                  <Button key="notes:more" plain onPress={() => void setFold($, 'notices', true)}>
+                    <Text color={accent}>+ {more} more</Text>
+                  </Button>
+                </Box>
+              )}
             </Box>
           </Box>
         )
@@ -1235,14 +1392,14 @@ export const register: Register = on => {
                     {fmtTokens(usage.context.window)} tokens
                   </Text>,
                 )}
-              {field('written', <Text color={c ? 'cyan_FOR_SUBAGENTS_ONLY' : 'text'}>↓ {fmtTokens(written)} tok</Text>)}
+              {field('written', <Text color="cyan_FOR_SUBAGENTS_ONLY">↓ {fmtTokens(written)} tok</Text>)}
               {field(
                 'turns',
                 <Text>
                   {turnList.length}
                   <Text color="inactive">
                     {' '}
-                    · {fmtSeconds(worked)} working{usage !== undefined ? ` · since ${hhmm(usage.startedAt)}` : ''}
+                    · {mins(worked)} working{usage !== undefined ? ` · since ${hhmm(usage.startedAt)}` : ''}
                   </Text>
                 </Text>,
               )}
@@ -1270,56 +1427,60 @@ export const register: Register = on => {
       }
 
       case 'History': {
+        // One row per turn in fixed columns: turn · at · prompt · tools · marks · took.
         const rows = [...turnList].reverse().slice(0, 40)
         const worked = turnList.reduce((n, t) => n + t.seconds, 0)
-        const longest = Math.max(1, ...rows.map(t => t.seconds))
-        const BAR = 8
-        const mins = (secs: number) => (secs < 60 ? '<1m' : `${Math.round(secs / 60)}m`)
-        const label = (n: number) => `turn ${n}`
-        const labelW = Math.max(6, ...rows.map(t => label(t.n).length))
-        const textW = Math.max(8, cols - labelW - 1 - 6 - BAR - 5 - 2)
+        const W = { turn: 4, at: 5, tools: 5, marks: 9, took: 4 }
+        const textW = Math.max(8, cols - (W.turn + W.at + W.tools + W.marks + W.took) - 5)
+        const marksOf = (t: TurnRec) =>
+          t.reason === 'aborted'
+            ? { text: '■ stopped', tone: 'warning' }
+            : t.reason === 'error' || t.reason === 'refusal'
+              ? { text: `× ${t.reason}`, tone: 'error' }
+              : t.errors > 0
+                ? { text: `${t.errors} failed`, tone: 'error' }
+                : { text: '', tone: 'inactive' }
         body = (
           <Box flexDirection="column" rowGap={1}>
             <Text color="inactive">
               {turnList.length} {turnList.length === 1 ? 'turn' : 'turns'} total · {mins(worked)} working
             </Text>
-            {rows.length === 0 && <Text color="inactive">No turns finished yet.</Text>}
-            {rows.map(t => {
-              const slow = rateTurn(t.seconds, 0, 'answer') === 'slow'
-              const barLen = Math.max(1, Math.round((t.seconds / longest) * BAR))
-              const jump = async () => {
-                if (t.promptId === undefined) {
-                  $.ui.toast(`Turn ${t.n}: no prompt row to jump to`)
-                  return
-                }
-                const r = await $.ui.scroll({ to: { requestId: t.promptId }, block: 'start' })
-                if (r.deny !== undefined) $.ui.toast(`Turn ${t.n} is no longer on screen`)
-              }
-              const words = clip((t.prompt ?? '(prompt not recorded)').replace(/\s+/g, ' '), textW).padEnd(textW)
-              return (
-                <Box key={`turn:${t.n}`} flexDirection="column">
-                  <Button key={`turnbtn:${t.n}`} plain onPress={jump}>
-                    <Text color="pink_FOR_SUBAGENTS_ONLY" bold>
-                      {label(t.n).padEnd(labelW)}{' '}
-                    </Text>
-                    <Text color="inactive">{hhmm(t.at)} </Text>
-                    <Text color={t.prompt === undefined ? 'inactive' : 'text'}>{words} </Text>
-                    <Text color={slow ? 'warning' : c ? 'cyan_FOR_SUBAGENTS_ONLY' : 'subtle'}>
-                      {'▬'.repeat(barLen).padEnd(BAR)}
-                    </Text>
-                    <Text color={slow ? 'warning' : 'inactive'}> {mins(t.seconds).padStart(4)}</Text>
-                  </Button>
-                  <Box paddingLeft={labelW + 7}>
-                    <Text color="inactive">
-                      {t.tools} {t.tools === 1 ? 'tool' : 'tools'}
-                      {t.errors > 0 && <Text color="error"> · {t.errors} failed</Text>}
-                      {t.reason === 'aborted' && <Text color="warning"> · ■ stopped</Text>}
-                      {(t.reason === 'error' || t.reason === 'refusal') && <Text color="error"> · × {t.reason}</Text>}
-                    </Text>
-                  </Box>
-                </Box>
-              )
-            })}
+            {rows.length === 0 ? (
+              <Text color="inactive">No turns finished yet.</Text>
+            ) : (
+              <Box flexDirection="column">
+                <Text color="inactive">
+                  {'turn'.padEnd(W.turn)} {'at'.padEnd(W.at)} {'prompt'.padEnd(textW)} {'tools'.padStart(W.tools)}{' '}
+                  {'marks'.padEnd(W.marks)} {'took'.padStart(W.took)}
+                </Text>
+                <Box flexDirection="row">{rule()}</Box>
+                {rows.map(t => {
+                  const slow = rateTurn(t.seconds, 0, 'answer') === 'slow'
+                  const mark = marksOf(t)
+                  const jump = async () => {
+                    if (t.promptId === undefined) {
+                      $.ui.toast(`Turn ${t.n}: no prompt row to jump to`)
+                      return
+                    }
+                    const r = await $.ui.scroll({ to: { requestId: t.promptId }, block: 'start' })
+                    if (r.deny !== undefined) $.ui.toast(`Turn ${t.n} is no longer on screen`)
+                  }
+                  const words = clip((t.prompt ?? '(prompt not recorded)').replace(/\s+/g, ' '), textW).padEnd(textW)
+                  return (
+                    <Button key={`turn:${t.n}`} plain onPress={jump}>
+                      <Text color={accent} bold>
+                        {String(t.n).padEnd(W.turn)}{' '}
+                      </Text>
+                      <Text color="inactive">{hhmm(t.at).padEnd(W.at)} </Text>
+                      <Text color={t.prompt === undefined ? 'inactive' : 'text'}>{words} </Text>
+                      <Text>{String(t.tools).padStart(W.tools)} </Text>
+                      <Text color={mark.tone}>{mark.text.padEnd(W.marks)} </Text>
+                      <Text color={slow ? 'warning' : 'inactive'}>{mins(t.seconds).padStart(W.took)}</Text>
+                    </Button>
+                  )
+                })}
+              </Box>
+            )}
           </Box>
         )
         break
@@ -1346,11 +1507,10 @@ export const register: Register = on => {
               {live.map(a => (
                 <Box key={`live:${a.id}`} flexDirection="column" paddingLeft={1}>
                   <Button key={`agent:${a.id}`} plain onPress={open(a.id)}>
-                    <Text color="warning">● </Text>
-                    <Text color={c ? 'purple_FOR_SUBAGENTS_ONLY' : 'text'} bold>
+                    <Text color="purple_FOR_SUBAGENTS_ONLY" bold>
                       ◆ {a.name ?? a.type}
                     </Text>
-                    <Text color="inactive"> {a.status}</Text>
+                    <Text color="warning"> {a.status}</Text>
                   </Button>
                   <Box paddingLeft={2}>
                     <Text wrap="truncate-end">{a.description}</Text>
@@ -1409,7 +1569,7 @@ export const register: Register = on => {
               {rows.length === 0 && <Text color="inactive">No edits yet.</Text>}
               {rows.map(([path, f]) => {
                 const d = isDirty(dirty, path)
-                const isOpen = expanded === path
+                const isOpenFile = expanded === path
                 const total = f.adds + f.dels
                 const cells = Math.max(1, Math.round((total / biggest) * BARS))
                 const addCells = total === 0 ? 0 : Math.round((f.adds / total) * cells)
@@ -1421,18 +1581,14 @@ export const register: Register = on => {
                     onPress={() => update($, expandedFile, cur => (cur === path ? null : path))}
                   >
                     <Text color={d === true ? 'warning' : 'inactive'}>{d === true ? '● ' : '· '}</Text>
-                    <Text bold={isOpen} color={d === false ? 'inactive' : 'text'}>
+                    <Text bold={isOpenFile} color={d === false ? 'inactive' : 'text'}>
                       {name}{' '}
                     </Text>
-                    {c ? (
-                      <Text>
-                        <Text color="success">{'▮'.repeat(addCells)}</Text>
-                        <Text color="error">{'▮'.repeat(cells - addCells)}</Text>
-                        {' '.repeat(BARS - cells)}
-                      </Text>
-                    ) : (
-                      <Text color="inactive">{`+${f.adds} −${f.dels}`.padEnd(BARS).slice(0, BARS + 4)}</Text>
-                    )}
+                    <Text>
+                      <Text color="success">{'▮'.repeat(addCells)}</Text>
+                      <Text color="error">{'▮'.repeat(cells - addCells)}</Text>
+                      {' '.repeat(BARS - cells)}
+                    </Text>
                     <Text color="inactive"> {`${f.edits}×`.padStart(4)}</Text>
                   </Button>
                 )
@@ -1455,7 +1611,105 @@ export const register: Register = on => {
         break
       }
 
-      case 'Settings': {
+      case 'Control': {
+        const [pinList, recentList, filter, editing, draft, colorEditing] = await Promise.all([
+          read($, pins),
+          read($, recent),
+          read($, cmdFilter),
+          read($, pinEdit),
+          read($, colorDraft),
+          read($, colorEdit),
+        ])
+        let commands: Awaited<ReturnType<typeof $.command.list>> = []
+        try {
+          commands = await $.command.list()
+        } catch {
+          commands = []
+        }
+        const byName = new Map(commands.map(c => [c.name, c]))
+        const run = (line: string) => () => void runCommandLine($, line)
+        const togglePin = (name: string) => () =>
+          void setPins($, l => (l.includes(name) ? l.filter(x => x !== name) : [...l, name]))
+
+        // A grid of command buttons, three to a row.
+        const cellW = Math.max(8, Math.floor((cols - 2) / 3))
+        const grid = (items: string[], keyPrefix: string) => {
+          const rows: string[][] = []
+          for (let i = 0; i < items.length; i += 3) rows.push(items.slice(i, i + 3))
+          return (
+            <Box flexDirection="column" paddingLeft={2}>
+              {rows.map((row, r) => (
+                <Box key={`${keyPrefix}:row:${r}`} flexDirection="row">
+                  {row.map(item => (
+                    <Box key={`${keyPrefix}:${item}`} width={cellW} flexShrink={0}>
+                      <Button key={`${keyPrefix}:btn:${item}`} plain onPress={run(item)}>
+                        <Text color="cyan_FOR_SUBAGENTS_ONLY">{clip(`/${item}`, cellW - 1)}</Text>
+                      </Button>
+                    </Box>
+                  ))}
+                </Box>
+              ))}
+            </Box>
+          )
+        }
+
+        // One listed command: pin mark, name, description.
+        const nameW = Math.min(20, Math.max(10, Math.floor(cols / 3)))
+        const listRow = (c: { name: string; description: string }, keyPrefix: string) => {
+          const pinned = pinList.includes(c.name)
+          return (
+            <Box key={`${keyPrefix}:${c.name}`} flexDirection="row" paddingLeft={2}>
+              <Box width={2} flexShrink={0}>
+                <Button key={`${keyPrefix}:pin:${c.name}`} plain onPress={togglePin(c.name)}>
+                  <Text color={pinned ? 'warning' : 'inactive'}>{pinned ? '◆' : '◇'}</Text>
+                </Button>
+              </Box>
+              <Box width={nameW} flexShrink={0}>
+                <Button key={`${keyPrefix}:run:${c.name}`} plain onPress={run(c.name)}>
+                  <Text color="cyan_FOR_SUBAGENTS_ONLY">{clip(`/${c.name}`, nameW - 1)}</Text>
+                </Button>
+              </Box>
+              <Box flexGrow={1} flexShrink={1}>
+                <Text color="inactive" wrap="truncate-end">
+                  {c.description}
+                </Text>
+              </Box>
+            </Box>
+          )
+        }
+        const group = (label: string, items: { name: string; description: string }[], keyPrefix: string) =>
+          items.length === 0 ? null : (
+            <Box key={`grp:${keyPrefix}`} flexDirection="column">
+              <Box paddingLeft={2}>
+                <Text color="inactive">{label}</Text>
+              </Box>
+              {items.map(c => listRow(c, keyPrefix))}
+            </Box>
+          )
+
+        // ---- all commands, grouped
+        const builtins = commands.filter(c => c.source === 'builtin')
+        const mapped = new Set(COMMAND_GROUPS.flatMap(([, names]) => [...names]))
+        const q = filter.trim().toLowerCase().replace(/^\//, '')
+        const matches = q === '' ? [] : commands.filter(c => `${c.name} ${c.description}`.toLowerCase().includes(q))
+        const recentShown = recentList.filter(n => !pinList.includes(n) && byName.has(n)).slice(0, RECENT_MAX)
+        const subFold = (key: string, label: string, count: number) => {
+          const open = isOpen(key)
+          return (
+            <Box paddingLeft={2}>
+              <Button key={`fold:${key}`} plain onPress={() => void setFold($, key, !open)}>
+                <Text color={accent}>{open ? '− ' : '+ '}</Text>
+                <Text color="inactive">
+                  {label} · {count}
+                </Text>
+              </Button>
+            </Box>
+          )
+        }
+        const plugins = commands.filter(c => c.source === 'plugin')
+        const mcps = commands.filter(c => c.source === 'mcp')
+
+        // ---- preferences (the former Settings tab)
         const toggle = (label: string, key: keyof Prefs, value: boolean, after?: (v: boolean) => Promise<void>) => (
           <Button
             key={`pref:${key}`}
@@ -1469,39 +1723,240 @@ export const register: Register = on => {
             <Text color={value ? 'text' : 'inactive'}>{label}</Text>
           </Button>
         )
+
         body = (
           <Box flexDirection="column" rowGap={1}>
             <Box flexDirection="column">
-              {section('transcript')}
-              {toggle('one-line tool rows in frames', 'compactRows', p.compactRows)}
-              {toggle('move engine notices to the panel', 'hideNotices', p.hideNotices)}
-              {toggle('color @files and /commands as you type', 'paint', p.paint)}
-              {toggle('tips under the prompt', 'tips', p.tips)}
+              {foldSection('pinned', 'pinned', String(pinList.length))}
+              {isOpen('pinned') && (
+                <Box flexDirection="column">
+                  {pinList.length === 0 ? (
+                    <Box paddingLeft={2}>
+                      <Text color="inactive">Nothing pinned. Pin with ◇ in all commands.</Text>
+                    </Box>
+                  ) : (
+                    grid(pinList, 'pin')
+                  )}
+                  <Box paddingLeft={2}>
+                    <Button key="pin:edit" plain onPress={() => void update($, pinEdit, v => !v)}>
+                      <Text color="inactive">{editing ? '− done' : '+ add or remove'}</Text>
+                    </Button>
+                  </Box>
+                  {editing && (
+                    <Box flexDirection="column" paddingLeft={2}>
+                      <Input
+                        key="pin:add"
+                        label="add › "
+                        placeholder="/compact keep the test results"
+                        submitLabel="pin"
+                        autoFocus
+                        onSubmit={value => {
+                          const line = value.trim().replace(/^\//, '').replace(/\s+/g, ' ')
+                          if (line !== '') void setPins($, l => (l.includes(line) ? l : [...l, line]))
+                        }}
+                      />
+                      {pinList.map(item => (
+                        <Button
+                          key={`pin:rm:${item}`}
+                          plain
+                          onPress={() => void setPins($, l => l.filter(x => x !== item))}
+                        >
+                          <Text color="error">× </Text>
+                          <Text color="inactive">/{item}</Text>
+                        </Button>
+                      ))}
+                    </Box>
+                  )}
+                </Box>
+              )}
             </Box>
+
             <Box flexDirection="column">
-              {section('alerts and keys')}
-              {toggle('notify when a long turn ends', 'alarm', p.alarm)}
-              {toggle(`${HOTKEY} focuses the panel`, 'hotkey', p.hotkey, v => syncBindings($, 'focus', v, true))}
-              {toggle('guard /tui (it restarts the session)', 'guardTui', p.guardTui)}
+              {foldSection('recent', 'recent', String(recentShown.length))}
+              {isOpen('recent') &&
+                (recentShown.length === 0 ? (
+                  <Box paddingLeft={2}>
+                    <Text color="inactive">Commands you run show up here.</Text>
+                  </Box>
+                ) : (
+                  grid(recentShown, 'recent')
+                ))}
             </Box>
+
             <Box flexDirection="column">
-              {section('data')}
-              <Button
-                key="reset"
-                plain
-                onPress={async () => {
-                  await update($, files, () => ({}))
-                  await update($, activity, () => [])
-                  await update($, turns, () => [])
-                  await update($, totals, () => EMPTY_TOTALS)
-                  await update($, notices, () => [])
-                  await update($, callTimes, () => [])
-                  await update($, expandedFile, () => null)
-                  $.ui.toast('Counters, files and history reset')
-                }}
-              >
-                <Text color="error">reset counters, files and history</Text>
-              </Button>
+              {foldSection('all', 'all commands', String(commands.length))}
+              {isOpen('all') && (
+                <Box flexDirection="column" rowGap={1}>
+                  <Box paddingLeft={2}>
+                    <Input
+                      key="cmd:filter"
+                      label="filter › "
+                      placeholder="type to narrow"
+                      value={filter}
+                      onInput={value => void update($, cmdFilter, () => value)}
+                      onSubmit={value => void update($, cmdFilter, () => value)}
+                    />
+                  </Box>
+                  {q !== '' ? (
+                    matches.length === 0 ? (
+                      <Box paddingLeft={2}>
+                        <Text color="inactive">No command matches.</Text>
+                      </Box>
+                    ) : (
+                      group(`${matches.length} found`, matches, 'match')
+                    )
+                  ) : (
+                    <Box flexDirection="column" rowGap={1}>
+                      {COMMAND_GROUPS.map(([label, names]) =>
+                        group(
+                          label,
+                          names.map(n => byName.get(n)).filter((c): c is NonNullable<typeof c> => c !== undefined),
+                          `g:${label}`,
+                        ),
+                      )}
+                      {group(
+                        'other built-ins',
+                        builtins.filter(c => !mapped.has(c.name)),
+                        'g:other',
+                      )}
+                      {group(
+                        'your commands',
+                        commands.filter(c => c.source === 'user'),
+                        'g:user',
+                      )}
+                      {plugins.length > 0 && (
+                        <Box flexDirection="column">
+                          {subFold('all:skills', 'skills & plugins', plugins.length)}
+                          {isOpen('all:skills') && plugins.map(c => listRow(c, 'g:plugin'))}
+                        </Box>
+                      )}
+                      {mcps.length > 0 && (
+                        <Box flexDirection="column">
+                          {subFold('all:mcp', 'mcp', mcps.length)}
+                          {isOpen('all:mcp') && mcps.map(c => listRow(c, 'g:mcp'))}
+                        </Box>
+                      )}
+                    </Box>
+                  )}
+                </Box>
+              )}
+            </Box>
+
+            <Box flexDirection="column">
+              {foldSection('colors', 'colors', draft.preset)}
+              {isOpen('colors') && (
+                <Box flexDirection="column" paddingLeft={2}>
+                  <Box flexDirection="row" columnGap={1}>
+                    <Box width={13} flexShrink={0}>
+                      <Text color="inactive">start from</Text>
+                    </Box>
+                    {Object.keys(COLOR_PRESETS).map(name => (
+                      <Button
+                        key={`preset:${name}`}
+                        plain
+                        onPress={() =>
+                          void setColors($, { preset: name, colors: { ...(COLOR_PRESETS[name]?.colors ?? {}) } })
+                        }
+                      >
+                        <Text color={name === draft.preset ? accent : 'inactive'} bold={name === draft.preset}>
+                          {name}
+                        </Text>
+                      </Button>
+                    ))}
+                  </Box>
+                  {COLOR_KEYS.map(([id, label]) => {
+                    const hex = draft.colors[id] ?? COLOR_PRESETS.dark?.colors[id] ?? '#ffffff'
+                    return (
+                      <Box key={`color:${id}`} flexDirection="row">
+                        <Box width={13} flexShrink={0}>
+                          <Text color="inactive">{label}</Text>
+                        </Box>
+                        {colorEditing === id ? (
+                          <Input
+                            key={`color:in:${id}`}
+                            placeholder="#rrggbb"
+                            value={hex}
+                            submitLabel="set"
+                            autoFocus
+                            onSubmit={value => {
+                              const v = value.trim()
+                              if (!/^#[0-9a-fA-F]{6}$/.test(v)) {
+                                $.ui.toast('A color is # and six hex digits, like #ff79c6')
+                                return
+                              }
+                              void (async () => {
+                                await setColors($, { ...draft, colors: { ...draft.colors, [id]: v.toLowerCase() } })
+                                await update($, colorEdit, () => null)
+                              })()
+                            }}
+                          />
+                        ) : (
+                          <Button key={`color:btn:${id}`} plain onPress={() => void update($, colorEdit, () => id)}>
+                            <Text backgroundColor={hex}>{'  '}</Text>
+                            <Text> {hex}</Text>
+                          </Button>
+                        )}
+                      </Box>
+                    )
+                  })}
+                  <Box flexDirection="row" columnGap={2} marginTop={1}>
+                    <Button key="colors:save" plain onPress={() => void saveMineTheme($)}>
+                      <Text color="success" bold>
+                        save as my theme
+                      </Text>
+                    </Button>
+                    <Button
+                      key="colors:reset"
+                      plain
+                      onPress={() => void setColors($, { preset: 'dark', colors: { ...(COLOR_PRESETS.dark?.colors ?? {}) } })}
+                    >
+                      <Text color="inactive">reset</Text>
+                    </Button>
+                  </Box>
+                  <Text color="inactive" wrap="wrap">
+                    Saved as "{MINE_THEME_NAME}". Pick it once in /theme: Claude Code does not switch themes while running.
+                  </Text>
+                </Box>
+              )}
+            </Box>
+
+            <Box flexDirection="column">
+              {foldSection('prefs', 'preferences')}
+              {isOpen('prefs') && (
+                <Box flexDirection="column" paddingLeft={2} rowGap={1}>
+                  <Box flexDirection="column">
+                    <Text color="inactive">transcript</Text>
+                    {toggle('one-line tool rows in frames', 'compactRows', p.compactRows)}
+                    {toggle('move Claude Code notices to the panel', 'hideNotices', p.hideNotices)}
+                    {toggle('color @files and /commands as you type', 'paint', p.paint)}
+                    {toggle('tips under the prompt', 'tips', p.tips)}
+                  </Box>
+                  <Box flexDirection="column">
+                    <Text color="inactive">alerts and keys</Text>
+                    {toggle('notify when a long turn ends', 'alarm', p.alarm)}
+                    {toggle(`${HOTKEY} focuses the panel`, 'hotkey', p.hotkey, v => syncBindings($, 'focus', v, true))}
+                  </Box>
+                  <Box flexDirection="column">
+                    <Text color="inactive">data</Text>
+                    <Button
+                      key="reset"
+                      plain
+                      onPress={async () => {
+                        await update($, files, () => ({}))
+                        await update($, activity, () => [])
+                        await update($, turns, () => [])
+                        await update($, totals, () => EMPTY_TOTALS)
+                        await update($, notices, () => [])
+                        await update($, callTimes, () => [])
+                        await update($, expandedFile, () => null)
+                        $.ui.toast('Counters, files and history reset')
+                      }}
+                    >
+                      <Text color="error">reset counters, files and history</Text>
+                    </Button>
+                  </Box>
+                </Box>
+              )}
             </Box>
           </Box>
         )

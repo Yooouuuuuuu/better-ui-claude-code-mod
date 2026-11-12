@@ -23,6 +23,8 @@ export type TurnRec = {
   promptId?: string
   /** The first words of the prompt that started the turn. */
   prompt?: string
+  /** How many lines Claude's reply ran to. */
+  replyLines?: number
   at: number
 }
 
@@ -56,8 +58,6 @@ export type Prefs = {
   hotkey: boolean
   /** Keep the pane resize chords (ctrl+x with an arrow) unbound in keybindings.json. */
   lockSize: boolean
-  /** Answer /tui in the mod's place: running it respawns the session and unloads dev mods. */
-  guardTui: boolean
 }
 
 declare module 'claude-code' {
@@ -80,8 +80,20 @@ declare module 'claude-code' {
       hidden: boolean
       /** Minimized: the pane is closed and one line above the prompt stands in for it. */
       mini: boolean
-      /** Whether Remote Control was connected when last checked; null before the first check. */
-      rc: boolean | null
+      /** Which Control and Overview sections are open, by key; kept in $.store. */
+      folds: Record<string, boolean>
+      /** Pinned command lines, without the slash (may carry arguments); kept in $.store. */
+      pins: string[]
+      /** Commands run lately, newest first; kept in $.store. */
+      recent: string[]
+      /** The all-commands filter text. */
+      cmdFilter: string
+      /** The pinned section's add-or-remove row is open. */
+      pinEdit: boolean
+      /** The colors being edited: a preset and the six colors; kept in $.store. */
+      colorDraft: { preset: string; colors: Record<string, string> }
+      /** Which color's hex field is open. */
+      colorEdit: string | null
     }
   }
 }
