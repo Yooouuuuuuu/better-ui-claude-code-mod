@@ -283,18 +283,8 @@ export const skinOf = (name: string): Skin => SKINS[name] ?? SKINS.line!
 export const toolIcon = (skin: Skin, tool: string): string => skin.tool[tool] ?? '·'
 
 // ---------------------------------------------------------------------------
-// Prompt tips and prompt-box coloring
+// Prompt-box coloring
 // ---------------------------------------------------------------------------
-
-export const TIPS: string[] = [
-  'alt+s moves into the panel, 1–6 or a/d switch its tabs',
-  'ctrl+o shows the full transcript behind the compact rows',
-  '/better-ui shows or minimizes the panel',
-  'esc returns from the panel to the prompt',
-  'Control tab: pin the commands you use most',
-  'History tab: click a turn to jump to its prompt',
-  'Control → colors: presets for terminals that show colors badly',
-]
 
 /** Color runs over the draft: `@file` references, a leading `/command`, and `code` spans. */
 export function decoratePrompt(text: string): PromptDecoration[] {

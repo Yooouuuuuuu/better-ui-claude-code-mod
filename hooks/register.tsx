@@ -1,14 +1,13 @@
 import { atom, read, update } from 'claude-code'
 import type { CoreEngineInterface, Register, Timer } from 'claude-code'
 
-import type { Activity, FileStat, Notice, Prefs, Running, Totals, TurnRec } from '../types'
+import type { Activity, EditRec, Notice, Prefs, Running, Totals, TurnRec } from '../types'
 import {
   EDIT_TOOLS,
   FOCUS_BINDINGS,
   KIND_COLOR,
   HOTKEY,
   LOCK_BINDINGS,
-  TIPS,
   SKINS,
   clip,
   countPatch,
@@ -50,14 +49,14 @@ const BIG_EDIT_LINES = 100
 const USER_TINT = 'userMessageBackground'
 const USER_ACCENT = 'briefLabelYou'
 const USER_RULE = 'subtle'
-const TABS = ['Overview', 'Usage', 'History', 'Agents', 'Files', 'Control'] as const
+const TABS = ['Overview', 'Usage', 'History', 'Agents', 'Control'] as const
 type Tab = (typeof TABS)[number]
 
 const DEFAULT_PREFS: Prefs = {
   compactRows: true,
   alarm: true,
   hideNotices: true,
-  tips: true,
+  showOwnNotices: true,
   paint: true,
   skin: 'line',
   hotkey: true,
@@ -78,9 +77,25 @@ const EMPTY_TOTALS: Totals = {
 // State (survives a hot reload; prefs also go to $.store)
 // ---------------------------------------------------------------------------
 
-const files = atom({ plugin: 'better-ui', key: 'files' } as const, {} as Record<string, FileStat>, {
-  shape: 'files-2',
-})
+/**
+ * A new file's preview: whole lines up to about 4,000 characters, the hunk
+ * header counting exactly the lines kept, so it stays a valid unified diff.
+ */
+function newFileDiff(lines: string[], maxChars = 4000): string {
+  const kept: string[] = []
+  let size = 0
+  for (const line of lines) {
+    if (size + line.length + 2 > maxChars && kept.length > 0) break
+    kept.push('+' + line)
+    size += line.length + 2
+  }
+  return [`@@ -0,0 +1,${kept.length} @@`, ...kept].join('\n')
+}
+
+/** Edits kept for History's changed files, each with its preview, for this session only. */
+const EDITS_KEPT = 150
+const TURNS_SHOWN = 5
+const edits = atom({ plugin: 'better-ui', key: 'edits' } as const, [] as EditRec[], { shape: 'edits-1' })
 const activity = atom({ plugin: 'better-ui', key: 'activity' } as const, [] as Activity[], {
   shape: 'activity-2',
 })
@@ -96,9 +111,8 @@ const prefs = atom({ plugin: 'better-ui', key: 'prefs' } as const, DEFAULT_PREFS
 const running = atom({ plugin: 'better-ui', key: 'running' } as const, null as Running | null)
 const tick = atom({ plugin: 'better-ui', key: 'tick' } as const, 0)
 const tab = atom({ plugin: 'better-ui', key: 'tab' } as const, 'Overview')
+const pickedTurn = atom({ plugin: 'better-ui', key: 'pickedTurn' } as const, null as number | null)
 const expandedFile = atom({ plugin: 'better-ui', key: 'expandedFile' } as const, null as string | null)
-const gitDirty = atom({ plugin: 'better-ui', key: 'gitDirty' } as const, null as string[] | null)
-const gitRoot = atom({ plugin: 'better-ui', key: 'gitRoot' } as const, null as string | null)
 const hidden = atom({ plugin: 'better-ui', key: 'hidden' } as const, false)
 const mini = atom({ plugin: 'better-ui', key: 'mini' } as const, false)
 const folds = atom({ plugin: 'better-ui', key: 'folds' } as const, {} as Record<string, boolean>)
@@ -147,7 +161,7 @@ async function expand($: CoreEngineInterface): Promise<string> {
   await update($, hidden, () => false)
   const opened = await $.ui.open({ id: PANE, title: TITLE, focus: true })
   return opened.isPlaced
-    ? 'Better UI shown. 1–6 or a/d switch tabs, m minimizes, Esc returns to the prompt.'
+    ? 'Better UI shown. 1–5 or a/d switch tabs, m minimizes, Esc returns to the prompt.'
     : `Better UI is waiting for room: ${opened.reason}`
 }
 
@@ -155,12 +169,23 @@ async function expand($: CoreEngineInterface): Promise<string> {
 // Helpers that use $
 // ---------------------------------------------------------------------------
 
+const NOTICES_KEPT = 80
+
+/** A toast from Better UI, also kept among the notices, marked as the mod's own. */
+function say($: CoreEngineInterface, text: string): void {
+  $.ui.toast(text)
+  void (async () => {
+    const at = await $.clock.now()
+    await update($, notices, list => [...list, { text, command: null, at, source: 'ui' as const }].slice(-NOTICES_KEPT))
+  })()
+}
+
 async function notify($: CoreEngineInterface, text: string): Promise<void> {
   try {
     const sent = await $.ui.notify(text, { title: TITLE })
-    if (!sent.isSent) $.ui.toast(text)
+    if (!sent.isSent) say($, text)
   } catch {
-    $.ui.toast(text)
+    say($, text)
   }
 }
 
@@ -198,22 +223,22 @@ async function syncBindings(
     if (r.text !== undefined) await $.fs.write(path, r.text)
     switch (r.outcome) {
       case 'installed':
-        $.ui.toast(`${name} installed (keybindings.json)`)
+        say($, `${name} installed (keybindings.json)`)
         break
       case 'removed':
-        $.ui.toast(`${name} removed (keybindings.json)`)
+        say($, `${name} removed (keybindings.json)`)
         break
       case 'occupied':
-        $.ui.toast(`${name}: a key is already bound to something else; not installed`)
+        say($, `${name}: a key is already bound to something else; not installed`)
         break
       case 'unparsable':
-        if (loud || want) $.ui.toast(`keybindings.json could not be parsed; ${name} left alone`)
+        if (loud || want) say($, `keybindings.json could not be parsed; ${name} left alone`)
         break
       default:
-        if (loud) $.ui.toast(want ? `${name} already installed` : `${name} was not installed`)
+        if (loud) say($, want ? `${name} already installed` : `${name} was not installed`)
     }
   } catch (err) {
-    if (loud) $.ui.toast(`${name}: ${err instanceof Error ? err.message : String(err)}`)
+    if (loud) say($, `${name}: ${err instanceof Error ? err.message : String(err)}`)
   }
 }
 
@@ -257,14 +282,14 @@ async function installThemes($: CoreEngineInterface): Promise<void> {
       wrote += 1
     }
     if (wrote > 0) {
-      $.ui.toast(
+      say($, 
         hadDir
           ? 'Better UI themes installed: pick one in /theme'
           : 'Better UI themes installed: restart Claude Code once, then pick one in /theme',
       )
     }
   } catch (err) {
-    $.ui.toast(`Better UI themes not installed: ${err instanceof Error ? err.message : String(err)}`)
+    say($, `Better UI themes not installed: ${err instanceof Error ? err.message : String(err)}`)
   }
 }
 
@@ -359,43 +384,6 @@ async function callRow(
 }
 
 /** Paths with uncommitted changes, relative to the repo root; null outside a repo. */
-async function refreshGit($: CoreEngineInterface): Promise<void> {
-  try {
-    const ran = await $.process.run(['git', 'status', '--porcelain', '--untracked-files=all'], {
-      timeoutMs: 8000,
-    })
-    const top = await $.process.run(['git', 'rev-parse', '--show-toplevel'], { timeoutMs: 8000 })
-    if (ran.exitCode !== 0 || top.exitCode !== 0) {
-      await update($, gitDirty, () => null)
-      await update($, gitRoot, () => null)
-      return
-    }
-    await update($, gitRoot, () => top.stdout.trim().replace(/\\/g, '/'))
-    const paths = ran.stdout
-      .split('\n')
-      .filter(l => l.length > 3)
-      .map(l => l.slice(3).trim().replace(/^"|"$/g, '').replace(/.* -> /, '').replace(/\\/g, '/'))
-    await update($, gitDirty, () => paths)
-  } catch {
-    await update($, gitDirty, () => null)
-    await update($, gitRoot, () => null)
-  }
-}
-
-/**
- * true: changed and not committed; false: committed; undefined: not in the
- * session's repo (or no repo). Paths compare whole, from the repo root, and
- * without case, as Windows paths do.
- */
-const isDirty = (dirty: string[] | null, root: string | null, path: string): boolean | undefined => {
-  if (dirty === null || root === null) return undefined
-  const p = path.replace(/\\/g, '/').toLowerCase()
-  const base = root.replace(/\/+$/, '').toLowerCase() + '/'
-  if (!p.startsWith(base)) return undefined
-  const rel = p.slice(base.length)
-  return dirty.some(d => d.toLowerCase() === rel)
-}
-
 // ---------------------------------------------------------------------------
 // The mod
 // ---------------------------------------------------------------------------
@@ -476,7 +464,7 @@ async function runCommandLine($: CoreEngineInterface, line: string): Promise<voi
     await $.command.run(args === '' ? { command } : { command, args })
     await recordRecent($, command)
   } catch (err) {
-    $.ui.toast(`/${command}: ${err instanceof Error ? err.message : String(err)}`)
+    say($, `/${command}: ${err instanceof Error ? err.message : String(err)}`)
   }
 }
 
@@ -513,9 +501,9 @@ async function saveMineTheme($: CoreEngineInterface): Promise<void> {
     const kb = await keybindingsPath($)
     const dir = kb.slice(0, kb.length - 'keybindings.json'.length) + 'themes'
     await $.fs.write(`${dir}/${MINE_THEME_FILE}`, JSON.stringify(theme, null, 2) + '\n')
-    $.ui.toast(`Saved "${MINE_THEME_NAME}". Pick it in /theme to use it.`)
+    say($, `Saved "${MINE_THEME_NAME}". Pick it in /theme to use it.`)
   } catch (err) {
-    $.ui.toast(`Theme not saved: ${err instanceof Error ? err.message : String(err)}`)
+    say($, `Theme not saved: ${err instanceof Error ? err.message : String(err)}`)
   }
 }
 
@@ -567,7 +555,6 @@ export const register: Register = on => {
     void syncBindings($, 'focus', merged.hotkey, false)
     void installThemes($)
     void syncBindings($, 'lock', merged.lockSize, false)
-    void refreshGit($)
     if (!(await read($, hidden)) && !(await read($, mini))) void $.ui.open({ id: PANE, title: TITLE })
 
     return next(e)
@@ -699,7 +686,10 @@ export const register: Register = on => {
       if (text !== '' && !seenNotices.has(text)) {
         seenNotices.add(text)
         const now = await $.clock.now()
-        await update($, notices, list => [...list, { text, command: null, at: now }].slice(-50))
+        const o = e.origin as { kind?: string; name?: string }
+        const source = o.kind === 'plugin' ? ('plugin' as const) : o.kind === 'hook' ? ('hook' as const) : undefined
+        const from = o.kind === 'plugin' && typeof o.name === 'string' ? o.name : undefined
+        await update($, notices, list => [...list, { text, command: null, at: now, source, from }].slice(-NOTICES_KEPT))
       }
     }
     return next(e)
@@ -725,7 +715,7 @@ export const register: Register = on => {
       // A subagent finished: say which one.
       try {
         const agent = (await $.agent.list()).find(a => a.id === e.agentId)
-        $.ui.toast(`Agent done: ${clip(agent?.description ?? e.agentId, 50)}`)
+        say($, `Agent done: ${clip(agent?.description ?? e.agentId, 50)}`)
       } catch {
         /* no agent list: stay quiet */
       }
@@ -769,7 +759,7 @@ export const register: Register = on => {
       return { ...t, streak, bestStreak: Math.max(t.bestStreak, streak) }
     })
     if (clean && tot.streak > 0 && tot.streak % 5 === 0) {
-      $.ui.toast(`Streak ×${tot.streak}: ${tot.streak} clean turns in a row`)
+      say($, `Streak ×${tot.streak}: ${tot.streak} clean turns in a row`)
     }
 
     const p = await read($, prefs)
@@ -786,13 +776,12 @@ export const register: Register = on => {
       const step = worst >= 95 ? 95 : worst >= 80 ? 80 : 0
       if (step > 0 && step > lastRateWarn) {
         lastRateWarn = step
-        $.ui.toast(`Account usage at ${Math.round(worst)}% of a rate-limit window`)
+        say($, `Account usage at ${Math.round(worst)}% of a rate-limit window`)
       }
     } catch {
       /* no usage figures */
     }
 
-    void refreshGit($)
     return next(e)
   }).catch(($, e, next) => next(e))
 
@@ -823,26 +812,16 @@ export const register: Register = on => {
       const createdLines = created === undefined ? [] : created.replace(/\n$/, '').split('\n')
       const counted = countPatch(ran.result)
       const patch = counted ?? (created === undefined ? undefined : { adds: createdLines.length, dels: 0 })
-      const diff =
-        patchToDiff(ran.result) ??
-        (created === undefined
-          ? undefined
-          : [`@@ -0,0 +1,${createdLines.length} @@`, ...createdLines.map(l => '+' + l)].join('\n').slice(0, 6000))
+      const diff = patchToDiff(ran.result) ?? (created === undefined ? undefined : newFileDiff(createdLines))
       const changed = (patch?.adds ?? 0) + (patch?.dels ?? 0)
       if (path !== undefined) {
-        await update($, files, map => {
-          const prev = map[path] ?? { adds: 0, dels: 0, edits: 0, last: 0 }
-          const stat: FileStat = {
-            adds: prev.adds + (patch?.adds ?? 0),
-            dels: prev.dels + (patch?.dels ?? 0),
-            edits: prev.edits + 1,
-            last: startedAt,
-          }
-          if (diff !== undefined) stat.diff = diff
-          return { ...map, [path]: stat }
-        })
+        const done = await read($, turns)
+        const turn = (done[done.length - 1]?.n ?? 0) + 1
+        const entry: EditRec = { turn, path, adds: patch?.adds ?? 0, dels: patch?.dels ?? 0, at: startedAt }
+        if (diff !== undefined) entry.diff = diff
+        await update($, edits, list => [...list, entry].slice(-EDITS_KEPT))
         if (changed >= BIG_EDIT_LINES) {
-          $.ui.toast(`Big edit: ${changed} lines in ${shortPath(path)}`)
+          say($, `Big edit: ${changed} lines in ${shortPath(path)}`)
         }
       }
     }
@@ -851,7 +830,7 @@ export const register: Register = on => {
       const out = rec(ran.result)
       const tests = detectTests(str(rec(e).command) ?? '', str(out.stdout) ?? '', str(out.stderr) ?? '')
       if (tests !== undefined) {
-        $.ui.toast(
+        say($, 
           tests.failed > 0
             ? `Tests: ${tests.failed} failed, ${tests.passed} passed`
             : `Tests: ${tests.passed} passed`,
@@ -873,9 +852,11 @@ export const register: Register = on => {
       if (risk !== undefined) text = `⚠ ${risk}`
     } else if (EDIT_TOOLS.has(e.tool)) {
       const path = str(rec(e.input).file_path) ?? str(rec(e.input).notebook_path)
-      const stat = path === undefined ? undefined : (await read($, files))[path]
-      if (stat !== undefined) {
-        text = `Edited ${stat.edits}× this session (+${stat.adds} −${stat.dels})`
+      const mine = path === undefined ? [] : (await read($, edits)).filter(x => x.path === path)
+      if (mine.length > 0) {
+        const adds = mine.reduce((n, x) => n + x.adds, 0)
+        const dels = mine.reduce((n, x) => n + x.dels, 0)
+        text = `Edited ${mine.length}× this session (+${adds} −${dels})`
       }
     }
     if (text !== undefined) {
@@ -896,12 +877,9 @@ export const register: Register = on => {
   }).catch(($, e, next) => next(e))
 
   on('ui.render', { component: 'PromptHint' }, async ($, e, next) => {
-    const [p, rc, count] = await Promise.all([read($, prefs), rcCached($), read($, turns).then(l => l.length)])
-    const parts: string[] = []
-    if (rc === true) parts.push('rc on')
-    if (p.tips && !e.props.isDraft && !e.props.isWorking) parts.push(TIPS[count % TIPS.length] ?? '')
-    if (parts.length === 0) return next(e)
-    return next({ ...e, props: { ...e.props, tail: parts.join(' · ') } })
+    // The only thing the mod adds to Claude Code's hint line: "rc on" while Remote Control is on.
+    if ((await rcCached($)) !== true) return next(e)
+    return next({ ...e, props: { ...e.props, tail: 'rc on' } })
   })
 
   on('ui.render', { component: 'SessionMode' }, async ($, e, next) => {
@@ -1043,7 +1021,7 @@ export const register: Register = on => {
       $.clock.after(1, () => {
         void (async () => {
           const now = await $.clock.now()
-          await update($, notices, list => [...list, { text: e.props.text, command, at: now }].slice(-50))
+          await update($, notices, list => [...list, { text: e.props.text, command, at: now }].slice(-NOTICES_KEPT))
         })()
       })
     }
@@ -1108,17 +1086,15 @@ export const register: Register = on => {
     const { Box, Text, Button, Code, Input } = $.ui.resolve(e)
     const cols = Math.max(24, e.props.bodyColumns)
     const now = await $.clock.now()
-    const [p, current, fileMap, turnList, noteList, run, dirty, expanded, fold, root] = await Promise.all([
+    const [p, current, editList, turnList, noteList, run, expanded, fold] = await Promise.all([
       read($, prefs),
       read($, tab),
-      read($, files),
+      read($, edits),
       read($, turns),
       read($, notices),
       read($, running),
-      read($, gitDirty),
       read($, expandedFile),
       read($, folds),
-      read($, gitRoot),
     ])
     const accent = 'pink_FOR_SUBAGENTS_ONLY'
     const active = (TABS as readonly string[]).includes(current) ? (current as Tab) : 'Overview'
@@ -1252,8 +1228,9 @@ export const register: Register = on => {
         const idleFor = last === undefined ? undefined : Math.max(0, Math.round((now - last.at) / 1000))
         const notesOpen = isOpen('notices')
         const NOTES_SHOWN = 3
-        const shown = notesOpen ? [...noteList].reverse() : noteList.slice(-NOTES_SHOWN).reverse()
-        const more = noteList.length - shown.length
+        const visible = p.showOwnNotices ? noteList : noteList.filter(nt => nt.source !== 'ui')
+        const shown = notesOpen ? [...visible].reverse() : visible.slice(-NOTES_SHOWN).reverse()
+        const more = visible.length - shown.length
         const result =
           last === undefined
             ? null
@@ -1317,10 +1294,30 @@ export const register: Register = on => {
               )}
             </Box>
             <Box flexDirection="column">
-              {noteList.length > NOTES_SHOWN
-                ? foldSection('notices', 'notices', String(noteList.length))
-                : section('notices', String(noteList.length))}
-              {noteList.length === 0 && <Text color="inactive">Nothing from Claude Code yet.</Text>}
+              <Box flexDirection="column">
+                <Box flexDirection="row" columnGap={1}>
+                  <Box flexShrink={0}>
+                    <Text bold>NOTICES</Text>
+                  </Box>
+                  <Box flexGrow={1} />
+                  <Box flexShrink={0}>
+                    <Text color="inactive">{visible.length}</Text>
+                  </Box>
+                  <Box flexShrink={0}>
+                    <Button
+                      key="notes:own"
+                      plain
+                      onPress={() => void savePrefs($, cur => ({ ...cur, showOwnNotices: !cur.showOwnNotices }))}
+                    >
+                      <Text color={p.showOwnNotices ? accent : 'inactive'} bold={p.showOwnNotices}>
+                        {p.showOwnNotices ? '▣' : '□'}
+                      </Text>
+                    </Button>
+                  </Box>
+                </Box>
+                <Box flexDirection="row">{rule(accent)}</Box>
+              </Box>
+              {visible.length === 0 && <Text color="inactive">Nothing yet.</Text>}
               {shown.map((nt, i) => (
                 <Box key={`note:${i}`} flexDirection="row" columnGap={1}>
                   <Box width={5} flexShrink={0}>
@@ -1336,12 +1333,28 @@ export const register: Register = on => {
                       </Button>
                     </Box>
                   )}
+                  {nt.source !== undefined && (
+                    <Box flexShrink={0}>
+                      {nt.source === 'ui' ? (
+                        <Text color={accent}>▣</Text>
+                      ) : (
+                        <Text color="inactive">{nt.from ?? nt.source}</Text>
+                      )}
+                    </Box>
+                  )}
                 </Box>
               ))}
               {!notesOpen && more > 0 && (
                 <Box paddingLeft={6}>
                   <Button key="notes:more" plain onPress={() => void setFold($, 'notices', true)}>
                     <Text color={accent}>+ {more} more</Text>
+                  </Button>
+                </Box>
+              )}
+              {notesOpen && visible.length > NOTES_SHOWN && (
+                <Box paddingLeft={6}>
+                  <Button key="notes:fewer" plain onPress={() => void setFold($, 'notices', false)}>
+                    <Text color={accent}>− fewer</Text>
                   </Button>
                 </Box>
               )}
@@ -1414,8 +1427,13 @@ export const register: Register = on => {
       }
 
       case 'History': {
-        // One row per turn in fixed columns: turn · at · prompt · tools · marks · took.
-        const rows = [...turnList].reverse().slice(0, 40)
+        // TURNS: the newest five in fixed columns, the rest behind "+ N more".
+        // CHANGED FILES: the picked turn's edits, else the latest turn's.
+        const picked = await read($, pickedTurn)
+        const allRows = [...turnList].reverse()
+        const turnsOpen = isOpen('turns:more')
+        const rows = turnsOpen ? allRows.slice(0, 40) : allRows.slice(0, TURNS_SHOWN)
+        const moreTurns = allRows.length - rows.length
         const worked = turnList.reduce((n, t) => n + t.seconds, 0)
         const W = { turn: 4, at: 5, tools: 5, marks: 9, took: 4 }
         const textW = Math.max(8, cols - (W.turn + W.at + W.tools + W.marks + W.took) - 5)
@@ -1427,47 +1445,150 @@ export const register: Register = on => {
               : t.errors > 0
                 ? { text: `${t.errors} failed`, tone: 'error' }
                 : { text: '', tone: 'inactive' }
+
+        // Which turn CHANGED FILES shows: the picked one, else the one running, else the last.
+        const runningNo = run !== null ? (turnList[turnList.length - 1]?.n ?? 0) + 1 : undefined
+        const shownNo = picked ?? runningNo ?? turnList[turnList.length - 1]?.n
+        type Row = { path: string; adds: number; dels: number; count: number; at: number; diff?: string }
+        const merged = new Map<string, Row>()
+        for (const x of editList) {
+          if (x.turn !== shownNo) continue
+          const prev = merged.get(x.path)
+          merged.set(x.path, {
+            path: x.path,
+            adds: (prev?.adds ?? 0) + x.adds,
+            dels: (prev?.dels ?? 0) + x.dels,
+            count: (prev?.count ?? 0) + 1,
+            at: x.at,
+            diff: x.diff ?? prev?.diff,
+          })
+        }
+        const fileRows = [...merged.values()].sort((r1, r2) => r2.at - r1.at)
+        const oldestKept = editList[0]?.turn
+        const tooOld =
+          shownNo !== undefined && editList.length >= EDITS_KEPT && oldestKept !== undefined && shownNo < oldestKept
+        const fAdds = fileRows.reduce((n, r) => n + r.adds, 0)
+        const fDels = fileRows.reduce((n, r) => n + r.dels, 0)
+        const shownRec = turnList.find(t => t.n === shownNo)
+        const jump = async () => {
+          if (shownRec?.promptId === undefined) {
+            $.ui.toast(shownNo === undefined ? 'No turn yet' : `Turn ${shownNo}: no prompt row to jump to`)
+            return
+          }
+          const r = await $.ui.scroll({ to: { requestId: shownRec.promptId }, block: 'start' })
+          if (r.deny !== undefined) $.ui.toast(`Turn ${shownNo} is no longer on screen`)
+        }
+        const pathW = Math.max(8, cols - 2 - 16)
+
         body = (
           <Box flexDirection="column" rowGap={1}>
-            <Text color="inactive">
-              {turnList.length} {turnList.length === 1 ? 'turn' : 'turns'} total · {mins(worked)} working
-            </Text>
-            {rows.length === 0 ? (
-              <Text color="inactive">No turns finished yet.</Text>
-            ) : (
-              <Box flexDirection="column">
-                <Text color="inactive">
-                  {'turn'.padEnd(W.turn)} {'at'.padEnd(W.at)} {'prompt'.padEnd(textW)} {'tools'.padStart(W.tools)}{' '}
-                  {'marks'.padEnd(W.marks)} {'took'.padStart(W.took)}
-                </Text>
-                <Box flexDirection="row">{rule()}</Box>
-                {rows.map(t => {
-                  const slow = rateTurn(t.seconds, 0, 'answer') === 'slow'
-                  const mark = marksOf(t)
-                  const jump = async () => {
-                    if (t.promptId === undefined) {
-                      $.ui.toast(`Turn ${t.n}: no prompt row to jump to`)
-                      return
-                    }
-                    const r = await $.ui.scroll({ to: { requestId: t.promptId }, block: 'start' })
-                    if (r.deny !== undefined) $.ui.toast(`Turn ${t.n} is no longer on screen`)
-                  }
-                  const words = clip((t.prompt ?? '(prompt not recorded)').replace(/\s+/g, ' '), textW).padEnd(textW)
-                  return (
-                    <Button key={`turn:${t.n}`} plain onPress={jump}>
-                      <Text color={accent} bold>
-                        {String(t.n).padEnd(W.turn)}{' '}
-                      </Text>
-                      <Text color="inactive">{hhmm(t.at).padEnd(W.at)} </Text>
-                      <Text color={t.prompt === undefined ? 'inactive' : 'text'}>{words} </Text>
-                      <Text>{String(t.tools).padStart(W.tools)} </Text>
-                      <Text color={mark.tone}>{mark.text.padEnd(W.marks)} </Text>
-                      <Text color={slow ? 'warning' : 'inactive'}>{mins(t.seconds).padStart(W.took)}</Text>
+            <Box flexDirection="column">
+              {section('turns', `${turnList.length} total · ${mins(worked)} working`)}
+              {allRows.length === 0 ? (
+                <Text color="inactive">No turns finished yet.</Text>
+              ) : (
+                <Box flexDirection="column">
+                  <Text color="inactive">
+                    {'#'.padEnd(W.turn)} {'at'.padEnd(W.at)} {'prompt'.padEnd(textW)} {'tools'.padStart(W.tools)}{' '}
+                    {'marks'.padEnd(W.marks)} {'took'.padStart(W.took)}
+                  </Text>
+                  <Box flexDirection="row">{rule()}</Box>
+                  {rows.map(t => {
+                    const slow = rateTurn(t.seconds, 0, 'answer') === 'slow'
+                    const mark = marksOf(t)
+                    const isPicked = t.n === shownNo
+                    const bg = isPicked ? 'userMessageBackground' : undefined
+                    const words = clip((t.prompt ?? '(prompt not recorded)').replace(/\\s+/g, ' '), textW).padEnd(textW)
+                    return (
+                      <Button
+                        key={`turn:${t.n}`}
+                        plain
+                        onPress={() => void update($, pickedTurn, cur => (cur === t.n ? null : t.n))}
+                      >
+                        <Text color={accent} bold backgroundColor={bg}>
+                          {String(t.n).padEnd(W.turn)}{' '}
+                        </Text>
+                        <Text color="inactive" backgroundColor={bg}>
+                          {hhmm(t.at).padEnd(W.at)}{' '}
+                        </Text>
+                        <Text color={t.prompt === undefined ? 'inactive' : 'text'} backgroundColor={bg}>
+                          {words}{' '}
+                        </Text>
+                        <Text backgroundColor={bg}>{String(t.tools).padStart(W.tools)} </Text>
+                        <Text color={mark.tone} backgroundColor={bg}>
+                          {mark.text.padEnd(W.marks)}{' '}
+                        </Text>
+                        <Text color={slow ? 'warning' : 'inactive'} backgroundColor={bg}>
+                          {mins(t.seconds).padStart(W.took)}
+                        </Text>
+                      </Button>
+                    )
+                  })}
+                  {moreTurns > 0 && (
+                    <Button key="turns:more" plain onPress={() => void setFold($, 'turns:more', true)}>
+                      <Text color={accent}>+ {moreTurns} more</Text>
                     </Button>
+                  )}
+                  {turnsOpen && allRows.length > TURNS_SHOWN && (
+                    <Button key="turns:fewer" plain onPress={() => void setFold($, 'turns:more', false)}>
+                      <Text color={accent}>− fewer</Text>
+                    </Button>
+                  )}
+                </Box>
+              )}
+            </Box>
+
+            <Box flexDirection="column">
+              {section(
+                'changed files',
+                shownNo === undefined
+                  ? undefined
+                  : `turn ${shownNo}${shownNo === runningNo ? ' (running)' : ''} · ${fileRows.length} ${fileRows.length === 1 ? 'file' : 'files'} · +${fAdds} −${fDels}`,
+              )}
+              {shownNo === undefined ? (
+                <Text color="inactive">No turns yet.</Text>
+              ) : tooOld ? (
+                <Text color="inactive">Turn {shownNo} is too old: its edits are no longer kept.</Text>
+              ) : fileRows.length === 0 ? (
+                <Text color="inactive">No files changed in turn {shownNo}.</Text>
+              ) : (
+                fileRows.map(r => {
+                  const key = `${shownNo}|${r.path}`
+                  const open = expanded === key
+                  return (
+                    <Box key={`frow:${key}`} flexDirection="column">
+                      <Button
+                        key={`fbtn:${key}`}
+                        plain
+                        onPress={() => update($, expandedFile, cur => (cur === key ? null : key))}
+                      >
+                        <Text color={accent}>{open ? '− ' : '+ '}</Text>
+                        <Text bold={open}>{clip(shortPath(r.path), pathW).padEnd(pathW)} </Text>
+                        <Text color="success">{`+${r.adds}`.padStart(5)}</Text>
+                        <Text color="error">{(r.dels > 0 ? `−${r.dels}` : '').padStart(5)}</Text>
+                        <Text color="inactive">{(r.count > 1 ? `${r.count}×` : '').padStart(4)}</Text>
+                      </Button>
+                      {open && (
+                        <Box flexDirection="column" borderStyle="round" borderColor="inactive" borderDimColor paddingX={1}>
+                          {r.diff !== undefined ? (
+                            <Code format="diff" source={r.diff} path={r.path} wrap="truncate-end" />
+                          ) : (
+                            <Text color="inactive">No preview for this edit.</Text>
+                          )}
+                        </Box>
+                      )}
+                    </Box>
                   )
-                })}
-              </Box>
-            )}
+                })
+              )}
+              {shownRec?.promptId !== undefined && (
+                <Box marginTop={1}>
+                  <Button key="turn:jump" plain onPress={jump}>
+                    <Text color="inactive">↑ jump to turn {shownNo}'s prompt</Text>
+                  </Button>
+                </Box>
+              )}
+            </Box>
           </Box>
         )
         break
@@ -1521,78 +1642,6 @@ export const register: Register = on => {
                 ))}
             </Box>
             <Button key="back" plain label="back to the main conversation" onPress={() => $.ui.view({})} />
-          </Box>
-        )
-        break
-      }
-
-      case 'Files': {
-        const rows = Object.entries(fileMap).sort((a, b) => b[1].last - a[1].last)
-        const adds = rows.reduce((n, [, f]) => n + f.adds, 0)
-        const dels = rows.reduce((n, [, f]) => n + f.dels, 0)
-        const biggest = Math.max(1, ...rows.map(([, f]) => f.adds + f.dels))
-        const BARS = 6
-        const pathW = Math.max(8, cols - 2 - BARS - 6 - 3)
-        const openFile = expanded === null ? undefined : fileMap[expanded]
-        body = (
-          <Box flexDirection="column" rowGap={1}>
-            <Box flexDirection="row" columnGap={1}>
-              <Text>
-                {rows.length} {rows.length === 1 ? 'file' : 'files'}
-              </Text>
-              <Text color="success">+{adds}</Text>
-              <Text color="error">−{dels}</Text>
-              <Box flexGrow={1} />
-              {dirty === null ? (
-                <Text color="inactive">not a git repo</Text>
-              ) : (
-                <Text>
-                  <Text color="warning">●</Text>
-                  <Text color="inactive"> not committed</Text>
-                </Text>
-              )}
-            </Box>
-            <Box flexDirection="column">
-              {rows.length === 0 && <Text color="inactive">No edits yet.</Text>}
-              {rows.map(([path, f]) => {
-                const d = isDirty(dirty, root, path)
-                const isOpenFile = expanded === path
-                const total = f.adds + f.dels
-                const cells = Math.max(1, Math.round((total / biggest) * BARS))
-                const addCells = total === 0 ? 0 : Math.round((f.adds / total) * cells)
-                const name = clip(shortPath(path), pathW).padEnd(pathW)
-                return (
-                  <Button
-                    key={`file:${path}`}
-                    plain
-                    onPress={() => update($, expandedFile, cur => (cur === path ? null : path))}
-                  >
-                    <Text color={d === true ? 'warning' : 'inactive'}>{d === true ? '● ' : '· '}</Text>
-                    <Text bold={isOpenFile} color={d === true ? 'text' : 'inactive'}>
-                      {name}{' '}
-                    </Text>
-                    <Text>
-                      <Text color="success">{'▮'.repeat(addCells)}</Text>
-                      <Text color="error">{'▮'.repeat(cells - addCells)}</Text>
-                      {' '.repeat(BARS - cells)}
-                    </Text>
-                    <Text color="inactive"> {`${f.edits}×`.padStart(4)}</Text>
-                  </Button>
-                )
-              })}
-            </Box>
-            {openFile !== undefined && expanded !== null && (
-              <Box flexDirection="column" borderStyle="round" borderColor="inactive" borderDimColor paddingX={1}>
-                <Text color="inactive">
-                  {shortPath(expanded)} · last edit · {hhmm(openFile.last)}
-                </Text>
-                {openFile.diff !== undefined ? (
-                  <Code format="diff" source={openFile.diff} path={expanded} wrap="truncate-end" />
-                ) : (
-                  <Text color="inactive">No preview of this edit: it was made before Better UI recorded previews.</Text>
-                )}
-              </Box>
-            )}
           </Box>
         )
         break
@@ -1916,7 +1965,6 @@ export const register: Register = on => {
                     {toggle('one-line tool rows in frames', 'compactRows', p.compactRows)}
                     {toggle('move Claude Code notices to the panel', 'hideNotices', p.hideNotices)}
                     {toggle('color @files and /commands as you type', 'paint', p.paint)}
-                    {toggle('tips under the prompt', 'tips', p.tips)}
                   </Box>
                   <Box flexDirection="column">
                     <Text color="inactive">alerts and keys</Text>
@@ -1929,12 +1977,13 @@ export const register: Register = on => {
                       key="reset"
                       plain
                       onPress={async () => {
-                        await update($, files, () => ({}))
+                        await update($, edits, () => [])
                         await update($, activity, () => [])
                         await update($, turns, () => [])
                         await update($, totals, () => EMPTY_TOTALS)
                         await update($, notices, () => [])
                         await update($, expandedFile, () => null)
+                        await update($, pickedTurn, () => null)
                         $.ui.toast('Counters, files and history reset')
                       }}
                     >

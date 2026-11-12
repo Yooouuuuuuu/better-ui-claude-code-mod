@@ -1,5 +1,5 @@
-/** One file Claude edited this session. `diff` is the last edit as a unified diff, when it fit. */
-export type FileStat = { adds: number; dels: number; edits: number; last: number; diff?: string }
+/** One edit Claude made: which turn, which file, its size, and its unified diff. */
+export type EditRec = { turn: number; path: string; adds: number; dels: number; at: number; diff?: string }
 
 /** One tool call, for the recent list and the compact rows. */
 export type Activity = {
@@ -41,7 +41,12 @@ export type Totals = {
 }
 
 /** An engine notice taken out of the transcript and shown in the pane. */
-export type Notice = { text: string; command: string | null; at: number }
+/**
+ * A notice for the Overview list. `source`: 'ui' for Better UI's own messages,
+ * 'plugin' or 'hook' for a row another plugin or a settings hook added (`from`
+ * names the plugin); absent for Claude Code's own.
+ */
+export type Notice = { text: string; command: string | null; at: number; source?: 'ui' | 'plugin' | 'hook'; from?: string }
 
 /** The turn in progress on the main loop. */
 export type Running = { startedAt: number; promptId?: string }
@@ -51,7 +56,8 @@ export type Prefs = {
   compactRows: boolean
   alarm: boolean
   hideNotices: boolean
-  tips: boolean
+  /** Show Better UI's own messages (marked ▣) among the notices. */
+  showOwnNotices: boolean
   paint: boolean
   skin: string
   /** Keep the panel's focus shortcut installed in ~/.claude/keybindings.json. */
@@ -63,7 +69,7 @@ export type Prefs = {
 declare module 'claude-code' {
   interface PluginState {
     'better-ui': {
-      files: Shaped<Record<string, FileStat>>
+      edits: Shaped<EditRec[]>
       activity: Shaped<Activity[]>
       turns: Shaped<TurnRec[]>
       totals: Shaped<Totals>
@@ -73,10 +79,9 @@ declare module 'claude-code' {
       running: Running | null
       tick: number
       tab: string
+      /** The turn History's changed files shows; null for the latest. */
+      pickedTurn: number | null
       expandedFile: string | null
-      gitDirty: string[] | null
-      /** The session's repo root, forward slashes; null outside a repo. */
-      gitRoot: string | null
       /** The person closed the pane this session: a reload keeps it closed. */
       hidden: boolean
       /** Minimized: the pane is closed and one line above the prompt stands in for it. */

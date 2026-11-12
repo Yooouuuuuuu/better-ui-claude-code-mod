@@ -14,7 +14,7 @@ Then restart Claude Code, or pick **Better UI** in `/theme`.
 
 ## Use
 
-- `alt+s` moves into the panel and `esc` leaves it. `1`–`6` or `a` / `d` switch tabs, `m` minimizes.
+- `alt+s` moves into the panel and `esc` leaves it. `1`–`5` or `a` / `d` switch tabs, `m` minimizes.
 - `/better-ui` shows or minimizes the panel.
 - The Control tab runs commands with a click: your pins, recent ones, and every command. It also holds the colors and preferences.
 
