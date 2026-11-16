@@ -4,6 +4,7 @@ import type { CoreEngineInterface, Register, Timer } from 'claude-code'
 import type { Activity, EditRec, Notice, Prefs, Running, Totals, TurnRec } from '../types'
 import {
   EDIT_TOOLS,
+  ARROW_BINDINGS,
   FOCUS_BINDINGS,
   KIND_COLOR,
   HOTKEY,
@@ -61,6 +62,9 @@ const DEFAULT_PREFS: Prefs = {
   skin: 'line',
   hotkey: true,
   lockSize: false,
+  lockArrows: true,
+  leftArrowOff: true,
+  companion: false,
 }
 const EMPTY_TOTALS: Totals = {
   calls: 0,
@@ -208,14 +212,116 @@ async function keybindingsPath($: CoreEngineInterface): Promise<string> {
  * Installs or removes one set of bindings in keybindings.json. The engine watches
  * that file, so the change applies at once. `loud` reports every outcome.
  */
+// ---------------------------------------------------------------------------
+// The companion: a small pixel figure in Overview's free space
+// ---------------------------------------------------------------------------
+
+const COMPANION_KEY = 'companion'
+const COMPANION_MS = 200
+type Sprite = { width: number; height: number; palette: number[]; frames: Uint8Array[] }
+/** undefined: not read yet; null: the asset is missing or unreadable. */
+let sprite: Sprite | null | undefined
+/** Raster cells per frame, built on first use and dropped when the animation stops. */
+const spriteCells = new Map<number, string>()
+
+async function loadSprite($: CoreEngineInterface): Promise<Sprite | null> {
+  if (sprite !== undefined) return sprite
+  try {
+    const v = rec(JSON.parse(String(await $.fs.read(`${$.plugin.root}/assets/companion.json`))))
+    const decode = (Uint8Array as unknown as { fromBase64(text: string): Uint8Array }).fromBase64
+    const frames = (Array.isArray(v.frames) ? v.frames.filter((f): f is string => typeof f === 'string') : []).map(f => decode(f))
+    const palette = Array.isArray(v.palette) ? v.palette.filter((c): c is number => typeof c === 'number') : []
+    const width = Number(v.width)
+    const height = Number(v.height)
+    const ok = width > 0 && height > 0 && height % 2 === 0 && frames.length > 0 && frames.every(f => f.length === width * height)
+    sprite = ok ? { width, height, palette, frames } : null
+  } catch {
+    sprite = null
+  }
+  return sprite
+}
+
+const EMPTY = 0x01000000
+
+/**
+ * One frame as Raster cells, `width` columns by `height / 2` rows: each cell
+ * is two pixels, the upper as the glyph's colour and the lower as its
+ * background; an empty pixel is the panel's own colour.
+ */
+function companionCells(s: Sprite, frame: number): string {
+  const cached = spriteCells.get(frame)
+  if (cached !== undefined) return cached
+  const src = s.frames[frame % s.frames.length] ?? new Uint8Array(s.width * s.height)
+  const colour = (x: number, y: number) => {
+    const i = src[y * s.width + x] ?? 0
+    return i === 0 ? EMPTY : (s.palette[i - 1] ?? EMPTY)
+  }
+  const words = new Uint32Array(s.width * (s.height / 2) * 3)
+  let at = 0
+  const put = (glyph: number, fg: number, bg: number) => {
+    words[at++] = glyph
+    words[at++] = fg
+    words[at++] = bg
+  }
+  for (let y = 0; y < s.height; y += 2) {
+    for (let x = 0; x < s.width; x++) {
+      const top = colour(x, y)
+      const bottom = colour(x, y + 1)
+      if (top === EMPTY && bottom === EMPTY) put(0x20, EMPTY, EMPTY)
+      else if (top === EMPTY) put(0x2584, bottom, EMPTY) // ▄
+      else put(0x2580, top, bottom) // ▀
+    }
+  }
+  const text = (new Uint8Array(words.buffer) as unknown as { toBase64(): string }).toBase64()
+  spriteCells.set(frame, text)
+  return text
+}
+
+/**
+ * Which frame at step `t`: 0 at rest, 1 the hop (two pixels lower). One hop
+ * every two seconds at rest, every second while a turn runs.
+ */
+function companionFrame(working: boolean, t: number): number {
+  return (working ? t % 5 === 2 : t % 10 === 5) ? 1 : 0
+}
+
+/**
+ * Claude Code's "← opens agents" setting. With it on, ← at an empty prompt
+ * moves the session into the background and opens agent view; the panel then
+ * runs in an attached background session, where mouse clicks do not arrive.
+ * `want`: the value the setting should hold. Quiet unless it changes it or `loud`.
+ */
+async function syncLeftArrow($: CoreEngineInterface, want: boolean, loud: boolean): Promise<void> {
+  try {
+    const row = (await $.config.list()).find(
+      r => r.key === 'leftArrowOpensAgents' || /opens agents/i.test(r.label),
+    )
+    if (row === undefined) {
+      if (loud) say($, '← opens agents: this Claude Code has no such setting')
+      return
+    }
+    if (row.value === want) return
+    if (row.isLocked) {
+      say($, '← opens agents is set by your organization; Better UI left it alone')
+      return
+    }
+    const r = await $.config.set({ key: row.key, value: want })
+    if (r.deny !== undefined) say($, `← opens agents not changed: ${r.deny}`)
+    else if (want) say($, '← at an empty prompt opens agent view again')
+    else say($, 'Turned off "← opens agents": it moved the session to the background, where the panel loses the mouse. Control → preferences turns it back on.')
+  } catch (err) {
+    if (loud) say($, `← opens agents: ${err instanceof Error ? err.message : String(err)}`)
+  }
+}
+
 async function syncBindings(
   $: CoreEngineInterface,
-  which: 'focus' | 'lock',
+  which: 'focus' | 'lock' | 'arrows',
   want: boolean,
   loud: boolean,
 ): Promise<void> {
-  const entries = which === 'focus' ? FOCUS_BINDINGS : LOCK_BINDINGS
-  const name = which === 'focus' ? `${HOTKEY} shortcut` : 'pane size lock'
+  const entries = which === 'focus' ? FOCUS_BINDINGS : which === 'arrows' ? ARROW_BINDINGS : LOCK_BINDINGS
+  const name = which === 'focus' ? `${HOTKEY} shortcut` : which === 'arrows' ? 'arrow keys inside the panel' : 'pane size lock'
   try {
     const path = await keybindingsPath($)
     const existing = (await $.fs.exists(path)) ? await $.fs.read(path) : null
@@ -392,7 +498,7 @@ async function callRow(
 // Control tab: commands, pins, recent, colors
 // ---------------------------------------------------------------------------
 
-const DEFAULT_PINS = ['remote-control', 'compact', 'context', 'rewind', 'resume', 'add-dir']
+const DEFAULT_PINS = ['remote-control', 'compact', 'fork', 'rewind', 'resume', 'add-dir']
 const RECENT_MAX = 5
 const DEFAULT_FOLDS: Record<string, boolean> = {
   pinned: true,
@@ -406,7 +512,7 @@ const DEFAULT_FOLDS: Record<string, boolean> = {
 
 /** Built-in commands sorted into the panel's groups; any other built-in lands in "other". */
 const COMMAND_GROUPS: readonly (readonly [string, readonly string[]])[] = [
-  ['session', ['compact', 'clear', 'resume', 'rewind', 'export', 'rename', 'exit']],
+  ['session', ['compact', 'clear', 'resume', 'rewind', 'fork', 'export', 'rename', 'exit']],
   ['model & context', ['model', 'context', 'usage', 'cost', 'effort', 'fast', 'status']],
   ['project', ['add-dir', 'init', 'memory', 'code-review', 'review', 'security-review', 'remote-control']],
   ['setup', ['config', 'theme', 'permissions', 'mcp', 'agents', 'plugin', 'keybindings', 'hooks', 'statusline', 'ide']],
@@ -514,6 +620,11 @@ export const register: Register = on => {
   let lastPromptText = ''
   let replyLinesThisTurn = 0
   let ticker: Timer | undefined
+  let companionTimer: Timer | undefined
+  let companionStep = 0
+  let companionMisses = 0
+  let companionDrawn: Sprite | undefined
+  let companionShown = -1
   let lastRateWarn = 0
   const seenNotices = new Set<string>()
 
@@ -541,7 +652,16 @@ export const register: Register = on => {
     const storedFolds = await $.store.get('folds')
     const storedColors = rec(await $.store.get('colors'))
     const strings = (v: unknown) => (Array.isArray(v) ? v.filter((x): x is string => typeof x === 'string') : null)
-    await update($, pins, () => strings(storedPins) ?? [...DEFAULT_PINS])
+    let startPins = strings(storedPins) ?? [...DEFAULT_PINS]
+    if (Number((await $.store.get('pinsVersion')) ?? 1) < 2) {
+      if (!startPins.includes('fork')) {
+        const at = startPins.indexOf('context')
+        startPins = at >= 0 ? startPins.map(x => (x === 'context' ? 'fork' : x)) : [...startPins, 'fork']
+        await $.store.set('pins', startPins)
+      }
+      await $.store.set('pinsVersion', 2)
+    }
+    await update($, pins, () => startPins)
     await update($, recent, () => strings(storedRecent) ?? [])
     await update($, folds, () =>
       Object.fromEntries(Object.entries(rec(storedFolds)).filter(([, v]) => typeof v === 'boolean')) as Record<string, boolean>,
@@ -555,6 +675,9 @@ export const register: Register = on => {
     void syncBindings($, 'focus', merged.hotkey, false)
     void installThemes($)
     void syncBindings($, 'lock', merged.lockSize, false)
+    void syncBindings($, 'arrows', merged.lockArrows, false)
+    // Only ever turns the shortcut off by itself; turning it on is the person's switch.
+    if (merged.leftArrowOff) void syncLeftArrow($, false, false)
     if (!(await read($, hidden)) && !(await read($, mini))) void $.ui.open({ id: PANE, title: TITLE })
 
     return next(e)
@@ -594,6 +717,11 @@ export const register: Register = on => {
     const out = await next(e)
     void recordRecent($, e.command)
     return out
+  }).catch(($, e, next) => (next.called ? undefined : next(e)))
+
+  on('ui.focus', { requestId: PANE }, async ($, e, next) => {
+    if (e.origin.kind === 'person' && e.element === undefined && (await read($, prefs)).lockArrows) return {}
+    return next(e)
   }).catch(($, e, next) => (next.called ? undefined : next(e)))
 
   // ---- the minimized line above the prompt --------------------------------
@@ -1083,7 +1211,10 @@ export const register: Register = on => {
   // ---- the pane ------------------------------------------------------------
 
   on('ui.render', { component: 'Pane', requestId: PANE }, async ($, e) => {
-    const { Box, Text, Button, Code, Input } = $.ui.resolve(e)
+    const elements = $.ui.resolve(e)
+    const { Box, Text, Button, Code, Input } = elements
+    // The cell grid is the terminal's alone; elsewhere the companion is left out.
+    const Raster = 'Raster' in elements ? elements.Raster : undefined
     const cols = Math.max(24, e.props.bodyColumns)
     const now = await $.clock.now()
     const [p, current, editList, turnList, noteList, run, expanded, fold] = await Promise.all([
@@ -1196,7 +1327,15 @@ export const register: Register = on => {
 
     // ---- footer: the hotkeys live on buttons that are not drawn
     const footer = (
-      <Box flexDirection="row" justifyContent="flex-end">
+      <Box flexDirection="row">
+        {active === 'Overview' && Raster !== undefined && e.props.placement === 'dock' && (
+          <Box flexShrink={0}>
+            <Button key="companion:toggle" plain onPress={() => void savePrefs($, cur => ({ ...cur, companion: !cur.companion }))}>
+              <Text color={p.companion ? accent : 'inactive'}>{p.companion ? '▣ avatar' : '□ avatar'}</Text>
+            </Button>
+          </Box>
+        )}
+        <Box flexGrow={1} />
         <Box display="none">
           {TABS.map((name, i) => (
             <Button key={`tab:${name}`} hotkey={String(i + 1)} plain label={name} onPress={() => go(name)} />
@@ -1231,6 +1370,58 @@ export const register: Register = on => {
         const visible = p.showOwnNotices ? noteList : noteList.filter(nt => nt.source !== 'ui')
         const shown = notesOpen ? [...visible].reverse() : visible.slice(-NOTES_SHOWN).reverse()
         const more = visible.length - shown.length
+
+        // The figure stands on the footer, in the rows the sections above leave free.
+        const figure = p.companion && Raster !== undefined ? await loadSprite($) : null
+        const noteRows =
+          visible.length === 0
+            ? 1
+            : shown.reduce((n, nt) => n + Math.max(1, Math.ceil(nt.text.length / Math.max(8, cols - 8))), 0) +
+              (more > 0 || (notesOpen && visible.length > NOTES_SHOWN) ? 1 : 0)
+        // header 2 · NOW 6 · LAST TURN 6 · NOTICES title 2 · footer 1 · five gaps, and one more above the figure
+        const usedRows = 2 + 6 + 6 + 2 + noteRows + 1 + 5 + 1
+        const freeRows = e.props.scroll.bodyRows - usedRows
+        const fit =
+          figure !== null && e.props.placement === 'dock' && figure.height / 2 <= freeRows && figure.width <= cols
+            ? figure
+            : undefined
+        companionDrawn = fit
+        if (fit !== undefined && companionTimer === undefined) {
+          companionMisses = 0
+          companionTimer = $.clock.every(COMPANION_MS, () => {
+            void (async () => {
+              companionStep += 1
+              const working = (await read($, running)) !== null
+              const frame = companionFrame(working, companionStep)
+              const drawn = companionDrawn
+              // Repaint only when the picture changes; one check a second tells whether it is still on screen.
+              if (drawn === undefined || (frame === companionShown && companionStep % 5 !== 0)) {
+                if (drawn === undefined) companionMisses += 1
+                if (companionMisses >= 15) {
+                  companionTimer?.cancel()
+                  companionTimer = undefined
+                  spriteCells.clear()
+                }
+                return
+              }
+              const r = await $.ui.blit({
+                requestId: PANE,
+                key: COMPANION_KEY,
+                cells: companionCells(drawn, frame),
+                columns: drawn.width,
+                rows: drawn.height / 2,
+              })
+              companionShown = r.deny === undefined ? frame : -1
+              // Not on screen (another tab, minimized, closed): stop after about three seconds.
+              companionMisses = r.deny === undefined ? 0 : companionMisses + 1
+              if (companionMisses >= 3) {
+                companionTimer?.cancel()
+                companionTimer = undefined
+                spriteCells.clear()
+              }
+            })().catch(() => {})
+          })
+        }
         const result =
           last === undefined
             ? null
@@ -1240,7 +1431,7 @@ export const register: Register = on => {
                 ? { text: `× ${last.reason} after ${fmtSeconds(last.seconds)}`, tone: 'error' }
                 : { text: `done in ${fmtSeconds(last.seconds)}`, tone: 'success' }
         body = (
-          <Box flexDirection="column" rowGap={1}>
+          <Box flexDirection="column" rowGap={1} flexGrow={1}>
             <Box flexDirection="column">
               {section('now')}
               {field(
@@ -1359,6 +1550,16 @@ export const register: Register = on => {
                 </Box>
               )}
             </Box>
+            {fit !== undefined && Raster !== undefined && (
+              <Box flexDirection="column" flexGrow={1} justifyContent="flex-end" alignItems="center">
+                <Raster
+                  key={COMPANION_KEY}
+                  columns={fit.width}
+                  rows={fit.height / 2}
+                  cells={companionCells(fit, companionFrame(run !== null, companionStep))}
+                />
+              </Box>
+            )}
           </Box>
         )
         break
@@ -1970,6 +2171,8 @@ export const register: Register = on => {
                     <Text color="inactive">alerts and keys</Text>
                     {toggle('notify when a long turn ends', 'alarm', p.alarm)}
                     {toggle(`${HOTKEY} focuses the panel`, 'hotkey', p.hotkey, v => syncBindings($, 'focus', v, true))}
+                    {toggle('arrow keys stay inside the panel', 'lockArrows', p.lockArrows, v => syncBindings($, 'arrows', v, true))}
+                    {toggle('← never opens agent view', 'leftArrowOff', p.leftArrowOff, v => syncLeftArrow($, !v, true))}
                   </Box>
                   <Box flexDirection="column">
                     <Text color="inactive">data</Text>

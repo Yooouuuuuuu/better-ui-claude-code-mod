@@ -349,6 +349,15 @@ export const HOTKEY_ACTION = 'abovePrompt:focus'
 export type BindingEntry = { context: string; key: string; value: string | null }
 /** The focus shortcut. */
 export const FOCUS_BINDINGS: readonly BindingEntry[] = [{ context: 'Chat', key: HOTKEY, value: HOTKEY_ACTION }]
+/**
+ * Left and Right move between the panel's controls, as Shift+Tab and Tab do.
+ * The Pane context binds neither by default, so they fell through to Claude
+ * Code's other keys (the footer's agent rows) and took focus out of the panel.
+ */
+export const ARROW_BINDINGS: readonly BindingEntry[] = [
+  { context: 'Pane', key: 'left', value: 'abovePrompt:previous' },
+  { context: 'Pane', key: 'right', value: 'abovePrompt:next' },
+]
 /** Unbinds the pane resize chords, so ctrl+x with an arrow no longer changes the pane's size. */
 export const LOCK_BINDINGS: readonly BindingEntry[] = [
   { context: 'Pane', key: 'ctrl+x left', value: null },

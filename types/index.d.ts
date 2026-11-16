@@ -64,6 +64,12 @@ export type Prefs = {
   hotkey: boolean
   /** Keep the pane resize chords (ctrl+x with an arrow) unbound in keybindings.json. */
   lockSize: boolean
+  /** Left and Right move between the panel's controls and never leave it (keybindings.json). */
+  lockArrows: boolean
+  /** Keep Claude Code's "← opens agents" setting off, so ← never backgrounds the session. */
+  leftArrowOff: boolean
+  /** Draw the animated figure in Overview's free rows. */
+  companion: boolean
 }
 
 declare module 'claude-code' {
