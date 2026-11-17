@@ -350,16 +350,26 @@ export type BindingEntry = { context: string; key: string; value: string | null 
 /** The focus shortcut. */
 export const FOCUS_BINDINGS: readonly BindingEntry[] = [{ context: 'Chat', key: HOTKEY, value: HOTKEY_ACTION }]
 /**
- * Left and Right move between the panel's controls, as Shift+Tab and Tab do.
- * The Pane context binds neither by default, so they fell through to Claude
- * Code's other keys (the footer's agent rows) and took focus out of the panel.
+ * The arrows inside the panel. Up and Down move between the tab's controls,
+ * as Shift+Tab and Tab do. Left and Right change tab: no key action reaches a
+ * mod's tabs, so they are bound to the pane's Home and End moves, which the
+ * module's `ui.scroll` hook answers by changing tab instead of scrolling.
+ * Unbound, Left and Right fall through to Claude Code's other keys (the
+ * footer's agent rows) and take focus out of the panel.
  */
 export const ARROW_BINDINGS: readonly BindingEntry[] = [
+  { context: 'Pane', key: 'left', value: 'pane:top' },
+  { context: 'Pane', key: 'right', value: 'pane:bottom' },
+  { context: 'Pane', key: 'up', value: 'abovePrompt:previous' },
+  { context: 'Pane', key: 'down', value: 'abovePrompt:next' },
+]
+/**
+ * What 0.4.0 and earlier wrote and this version no longer does: the old arrow
+ * lines and the unbound pane resize chords. Taken out at every start.
+ */
+export const OLD_BINDINGS: readonly BindingEntry[] = [
   { context: 'Pane', key: 'left', value: 'abovePrompt:previous' },
   { context: 'Pane', key: 'right', value: 'abovePrompt:next' },
-]
-/** Unbinds the pane resize chords, so ctrl+x with an arrow no longer changes the pane's size. */
-export const LOCK_BINDINGS: readonly BindingEntry[] = [
   { context: 'Pane', key: 'ctrl+x left', value: null },
   { context: 'Pane', key: 'ctrl+x right', value: null },
   { context: 'Pane', key: 'ctrl+x up', value: null },

@@ -22,6 +22,7 @@ Then restart Claude Code, or pick **Better UI** in `/theme`.
 
 - Designed for Fira Code. Every symbol it draws is also in Cascadia Mono.
 - The main background comes from your terminal's color scheme, not the theme. If colors look wrong, try a preset in Control → colors.
+- On WSL or other Linux terminals, colors look wrong unless full color is declared. Run `echo 'export COLORTERM=truecolor' >> ~/.bashrc` once, then open a new terminal.
 - It turns off Claude Code's "← opens agents" setting. With it on, ← at an empty prompt moves the session to the background, where the panel loses the mouse. Control → preferences turns it back on; to do it by hand, run `/config leftArrowOpensAgents=false`.
 - If the mouse stops working in the panel, the session is attached to a background copy: run `/stop`, open a new terminal, then `claude --resume`.
-- It writes `~/.claude/themes/better-ui.json` (and `better-ui-mine.json` if you save your own colors) and adds `alt+s` to `~/.claude/keybindings.json`. Turn the key off in Control → preferences before uninstalling.
+- It writes `~/.claude/themes/better-ui.json` (and `better-ui-mine.json` if you save your own colors). In `~/.claude/keybindings.json` it adds `alt+s` and the arrow keys for plugin panes. Turn both off in Control → preferences before uninstalling, or they stay behind.

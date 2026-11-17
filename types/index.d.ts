@@ -62,9 +62,7 @@ export type Prefs = {
   skin: string
   /** Keep the panel's focus shortcut installed in ~/.claude/keybindings.json. */
   hotkey: boolean
-  /** Keep the pane resize chords (ctrl+x with an arrow) unbound in keybindings.json. */
-  lockSize: boolean
-  /** Left and Right move between the panel's controls and never leave it (keybindings.json). */
+  /** The arrows stay in the panel: Left and Right change tab, Up and Down move between its controls (keybindings.json). */
   lockArrows: boolean
   /** Keep Claude Code's "← opens agents" setting off, so ← never backgrounds the session. */
   leftArrowOff: boolean

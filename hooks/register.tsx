@@ -8,7 +8,7 @@ import {
   FOCUS_BINDINGS,
   KIND_COLOR,
   HOTKEY,
-  LOCK_BINDINGS,
+  OLD_BINDINGS,
   SKINS,
   clip,
   countPatch,
@@ -61,7 +61,6 @@ const DEFAULT_PREFS: Prefs = {
   paint: true,
   skin: 'line',
   hotkey: true,
-  lockSize: false,
   lockArrows: true,
   leftArrowOff: true,
   companion: false,
@@ -314,19 +313,55 @@ async function syncLeftArrow($: CoreEngineInterface, want: boolean, loud: boolea
   }
 }
 
+/** Claude Code's version, as `claude --version` prints it; read once. */
+let engineVersionText: string | undefined
+async function engineVersion($: CoreEngineInterface): Promise<string> {
+  if (engineVersionText === undefined) {
+    try {
+      engineVersionText = (await $.session.version()).version
+    } catch {
+      return '—'
+    }
+  }
+  return engineVersionText
+}
+
+/** The keys of a drawn tree's controls in the order the focus ring walks them; what is not drawn is left out. */
+function controlKeys(node: unknown, out: string[] = []): string[] {
+  if (Array.isArray(node)) {
+    for (const child of node) controlKeys(child, out)
+    return out
+  }
+  if (node === null || typeof node !== 'object') return out
+  const el = node as { type?: unknown; props?: Record<string, unknown>; children?: unknown }
+  const props = el.props ?? {}
+  if (props.display === 'none') return out
+  if ((el.type === 'Button' || el.type === 'Input' || el.type === 'Select') && typeof props.key === 'string') {
+    out.push(props.key)
+    return out
+  }
+  controlKeys(props.children, out)
+  controlKeys(el.children, out)
+  return out
+}
+
 async function syncBindings(
   $: CoreEngineInterface,
-  which: 'focus' | 'lock' | 'arrows',
+  which: 'focus' | 'arrows',
   want: boolean,
   loud: boolean,
 ): Promise<void> {
-  const entries = which === 'focus' ? FOCUS_BINDINGS : which === 'arrows' ? ARROW_BINDINGS : LOCK_BINDINGS
-  const name = which === 'focus' ? `${HOTKEY} shortcut` : which === 'arrows' ? 'arrow keys inside the panel' : 'pane size lock'
+  const entries = which === 'focus' ? FOCUS_BINDINGS : ARROW_BINDINGS
+  const name = which === 'focus' ? `${HOTKEY} shortcut` : 'arrow keys inside the panel'
   try {
     const path = await keybindingsPath($)
     const existing = (await $.fs.exists(path)) ? await $.fs.read(path) : null
-    const r = mergeBindings(typeof existing === 'string' ? existing : null, entries, want)
-    if (r.text !== undefined) await $.fs.write(path, r.text)
+    const before = typeof existing === 'string' ? existing : null
+    // An earlier version's arrow lines go first, so the new ones are not refused as taken.
+    const cleaned = which === 'arrows' ? mergeBindings(before, OLD_BINDINGS, false).text : undefined
+    const r = mergeBindings(cleaned ?? before, entries, want)
+    const text = r.text ?? (r.outcome === 'unparsable' ? undefined : cleaned)
+    if (text !== undefined) await $.fs.write(path, text)
     switch (r.outcome) {
       case 'installed':
         say($, `${name} installed (keybindings.json)`)
@@ -625,6 +660,8 @@ export const register: Register = on => {
   let companionMisses = 0
   let companionDrawn: Sprite | undefined
   let companionShown = -1
+  /** The first and last control of the tab as last drawn, the header's dots left out. */
+  let ring: { first?: string; last?: string } = {}
   let lastRateWarn = 0
   const seenNotices = new Set<string>()
 
@@ -672,10 +709,9 @@ export const register: Register = on => {
     ) as Record<string, string>
     await update($, colorDraft, () => ({ preset, colors: { ...(COLOR_PRESETS[preset]?.colors ?? {}), ...savedColors } }))
 
-    void syncBindings($, 'focus', merged.hotkey, false)
+    // One after the other: both rewrite keybindings.json.
+    void syncBindings($, 'focus', merged.hotkey, false).then(() => syncBindings($, 'arrows', merged.lockArrows, false))
     void installThemes($)
-    void syncBindings($, 'lock', merged.lockSize, false)
-    void syncBindings($, 'arrows', merged.lockArrows, false)
     // Only ever turns the shortcut off by itself; turning it on is the person's switch.
     if (merged.leftArrowOff) void syncLeftArrow($, false, false)
     if (!(await read($, hidden)) && !(await read($, mini))) void $.ui.open({ id: PANE, title: TITLE })
@@ -720,8 +756,27 @@ export const register: Register = on => {
   }).catch(($, e, next) => (next.called ? undefined : next(e)))
 
   on('ui.focus', { requestId: PANE }, async ($, e, next) => {
-    if (e.origin.kind === 'person' && e.element === undefined && (await read($, prefs)).lockArrows) return {}
-    return next(e)
+    if (e.origin.kind !== 'person' || !(await read($, prefs)).lockArrows) return next(e)
+    // Never onto the engine's own stops, which lead out of the panel.
+    if (e.element === undefined) return {}
+    // Up and Down walk the tab's controls, not the header's dots (Left and Right
+    // change tab). The ring's two ends are dots a key can reach: land past them.
+    const to = e.element === `dot:${TABS[0]}` ? ring.first : e.element === `dot:${TABS[TABS.length - 1]}` ? ring.last : e.element
+    if (to === undefined) return {}
+    return next(to === e.element ? e : { ...e, element: to })
+  }).catch(($, e, next) => (next.called ? undefined : next(e)))
+
+  // Left and Right are bound to the pane's Home and End moves (ARROW_BINDINGS),
+  // which ask for the whole tree's rows: change tab and leave the window alone.
+  on('ui.scroll', { requestId: PANE }, async ($, e, next) => {
+    const whole = e.by !== 0 && Math.abs(e.by) >= e.contentRows
+    if (e.origin.kind !== 'person' || e.pointer !== undefined || !whole || !(await read($, prefs)).lockArrows) return next(e)
+    const by = e.by < 0 ? -1 : 1
+    await update($, tab, cur => {
+      const i = Math.max(0, (TABS as readonly string[]).indexOf(cur))
+      return TABS[(i + by + TABS.length) % TABS.length] ?? 'Overview'
+    })
+    return {}
   }).catch(($, e, next) => (next.called ? undefined : next(e)))
 
   // ---- the minimized line above the prompt --------------------------------
@@ -1358,7 +1413,7 @@ export const register: Register = on => {
     let body
     switch (active) {
       case 'Overview': {
-        const [pct, liveAgents] = await Promise.all([contextPercent($), liveAgentCount($)])
+        const [pct, liveAgents, engine] = await Promise.all([contextPercent($), liveAgentCount($), engineVersion($)])
         // While a turn runs, redraw with the clock so "working 0:42" keeps counting.
         if (run !== null) await read($, tick)
         const elapsed = run === null ? 0 : Math.max(0, Math.round((now - run.startedAt) / 1000))
@@ -1378,8 +1433,8 @@ export const register: Register = on => {
             ? 1
             : shown.reduce((n, nt) => n + Math.max(1, Math.ceil(nt.text.length / Math.max(8, cols - 8))), 0) +
               (more > 0 || (notesOpen && visible.length > NOTES_SHOWN) ? 1 : 0)
-        // header 2 · NOW 6 · LAST TURN 6 · NOTICES title 2 · footer 1 · five gaps, and one more above the figure
-        const usedRows = 2 + 6 + 6 + 2 + noteRows + 1 + 5 + 1
+        // header 2 · NOW 7 · LAST TURN 6 · NOTICES title 2 · footer 1 · five gaps, and one more above the figure
+        const usedRows = 2 + 7 + 6 + 2 + noteRows + 1 + 5 + 1
         const freeRows = e.props.scroll.bodyRows - usedRows
         const fit =
           figure !== null && e.props.placement === 'dock' && figure.height / 2 <= freeRows && figure.width <= cols
@@ -1464,6 +1519,7 @@ export const register: Register = on => {
                   {liveAgents > 0 ? `${liveAgents} running` : 'none'}
                 </Text>,
               )}
+              {field('claude', engine)}
             </Box>
             <Box flexDirection="column">
               {section('last turn', last === undefined ? undefined : `turn ${last.n}`)}
@@ -2171,7 +2227,7 @@ export const register: Register = on => {
                     <Text color="inactive">alerts and keys</Text>
                     {toggle('notify when a long turn ends', 'alarm', p.alarm)}
                     {toggle(`${HOTKEY} focuses the panel`, 'hotkey', p.hotkey, v => syncBindings($, 'focus', v, true))}
-                    {toggle('arrow keys stay inside the panel', 'lockArrows', p.lockArrows, v => syncBindings($, 'arrows', v, true))}
+                    {toggle('arrows: ←→ tabs, ↑↓ inside the tab', 'lockArrows', p.lockArrows, v => syncBindings($, 'arrows', v, true))}
                     {toggle('← never opens agent view', 'leftArrowOff', p.leftArrowOff, v => syncLeftArrow($, !v, true))}
                   </Box>
                   <Box flexDirection="column">
@@ -2204,6 +2260,8 @@ export const register: Register = on => {
 
     // Docked, the frame has a fixed height: fill it so the footer sits on its last row.
     const minHeight = e.props.placement === 'dock' ? Math.max(0, e.props.scroll.bodyRows) : undefined
+    const stops = controlKeys([body, footer]).filter(key => !key.startsWith('dot:'))
+    ring = { first: stops[0], last: stops[stops.length - 1] }
     return (
       <Box flexDirection="column" rowGap={1} minHeight={minHeight}>
         {header}
