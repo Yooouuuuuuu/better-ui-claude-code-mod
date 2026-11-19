@@ -35,6 +35,8 @@ import {
   str,
   toolIcon,
 } from './lib'
+import { AVATAR_H, AVATAR_W, BUBBLE_W, avatarCells, avatarKey, clearAvatarCells } from './avatar'
+import type { AvatarEvents, AvatarState } from './avatar'
 
 // ---------------------------------------------------------------------------
 // Settings
@@ -212,76 +214,19 @@ async function keybindingsPath($: CoreEngineInterface): Promise<string> {
  * that file, so the change applies at once. `loud` reports every outcome.
  */
 // ---------------------------------------------------------------------------
-// The companion: a small pixel figure in Overview's free space
+// The avatar: a pixel figure in Overview's free space (drawn by avatar.ts)
 // ---------------------------------------------------------------------------
 
 const COMPANION_KEY = 'companion'
-const COMPANION_MS = 200
-type Sprite = { width: number; height: number; palette: number[]; frames: Uint8Array[] }
-/** undefined: not read yet; null: the asset is missing or unreadable. */
-let sprite: Sprite | null | undefined
-/** Raster cells per frame, built on first use and dropped when the animation stops. */
-const spriteCells = new Map<number, string>()
+const COMPANION_MS = 100
+/** A tool's loop stays this many steps after the call ends, so quick calls do not flicker. */
+const AVATAR_HOLD_STEPS = 16
 
-async function loadSprite($: CoreEngineInterface): Promise<Sprite | null> {
-  if (sprite !== undefined) return sprite
-  try {
-    const v = rec(JSON.parse(String(await $.fs.read(`${$.plugin.root}/assets/companion.json`))))
-    const decode = (Uint8Array as unknown as { fromBase64(text: string): Uint8Array }).fromBase64
-    const frames = (Array.isArray(v.frames) ? v.frames.filter((f): f is string => typeof f === 'string') : []).map(f => decode(f))
-    const palette = Array.isArray(v.palette) ? v.palette.filter((c): c is number => typeof c === 'number') : []
-    const width = Number(v.width)
-    const height = Number(v.height)
-    const ok = width > 0 && height > 0 && height % 2 === 0 && frames.length > 0 && frames.every(f => f.length === width * height)
-    sprite = ok ? { width, height, palette, frames } : null
-  } catch {
-    sprite = null
-  }
-  return sprite
-}
-
-const EMPTY = 0x01000000
-
-/**
- * One frame as Raster cells, `width` columns by `height / 2` rows: each cell
- * is two pixels, the upper as the glyph's colour and the lower as its
- * background; an empty pixel is the panel's own colour.
- */
-function companionCells(s: Sprite, frame: number): string {
-  const cached = spriteCells.get(frame)
-  if (cached !== undefined) return cached
-  const src = s.frames[frame % s.frames.length] ?? new Uint8Array(s.width * s.height)
-  const colour = (x: number, y: number) => {
-    const i = src[y * s.width + x] ?? 0
-    return i === 0 ? EMPTY : (s.palette[i - 1] ?? EMPTY)
-  }
-  const words = new Uint32Array(s.width * (s.height / 2) * 3)
-  let at = 0
-  const put = (glyph: number, fg: number, bg: number) => {
-    words[at++] = glyph
-    words[at++] = fg
-    words[at++] = bg
-  }
-  for (let y = 0; y < s.height; y += 2) {
-    for (let x = 0; x < s.width; x++) {
-      const top = colour(x, y)
-      const bottom = colour(x, y + 1)
-      if (top === EMPTY && bottom === EMPTY) put(0x20, EMPTY, EMPTY)
-      else if (top === EMPTY) put(0x2584, bottom, EMPTY) // ▄
-      else put(0x2580, top, bottom) // ▀
-    }
-  }
-  const text = (new Uint8Array(words.buffer) as unknown as { toBase64(): string }).toBase64()
-  spriteCells.set(frame, text)
-  return text
-}
-
-/**
- * Which frame at step `t`: 0 at rest, 1 the hop (two pixels lower). One hop
- * every two seconds at rest, every second while a turn runs.
- */
-function companionFrame(working: boolean, t: number): number {
-  return (working ? t % 5 === 2 : t % 10 === 5) ? 1 : 0
+/** Which loop a tool call shows while it runs; any other tool leaves the figure thinking. */
+function avatarToolState(tool: string): AvatarState | undefined {
+  if (EDIT_TOOLS.has(tool)) return 'writing'
+  if (tool === 'Read' || tool === 'Grep' || tool === 'Glob' || tool === 'Bash' || tool === 'PowerShell') return 'computer'
+  return undefined
 }
 
 /**
@@ -658,8 +603,39 @@ export const register: Register = on => {
   let companionTimer: Timer | undefined
   let companionStep = 0
   let companionMisses = 0
-  let companionDrawn: Sprite | undefined
-  let companionShown = -1
+  /** Set while Overview draws the figure: whether the bubble strip fits beside it. */
+  let companionDrawn: { bubbles: boolean } | undefined
+  let companionShown = ''
+  /** The main loop's tool calls in flight that have a loop of their own, by call id. */
+  const avatarTools = new Map<string, AvatarState>()
+  let avatarHeld: { state: AvatarState; step: number } | undefined
+  let avatarState: AvatarState = 'idle'
+  let avatarSince = 0
+  let avatarAgents = 0
+  /** How the last turn ended and its errors; undefined once the next turn starts. */
+  let avatarLast: { outcome: 'done' | 'stopped' | null; errors: number } | undefined
+  /** What the figure shows now: a running tool's loop, else agents, thinking or idle; and the bubbles. */
+  const avatarNow = (working: boolean): { state: AvatarState; t: number; ev: AvatarEvents } => {
+    const active = [...avatarTools.values()]
+    const held =
+      working && avatarHeld !== undefined && companionStep - avatarHeld.step <= AVATAR_HOLD_STEPS ? avatarHeld.state : undefined
+    const state: AvatarState = active.includes('writing')
+      ? 'writing'
+      : active.includes('computer')
+        ? 'computer'
+        : (held ?? (avatarAgents > 0 ? 'agents' : working ? 'thinking' : 'idle'))
+    // A loop starts over only when the activity changes.
+    if (state !== avatarState) {
+      avatarState = state
+      avatarSince = companionStep
+    }
+    const ev: AvatarEvents = {
+      outcome: working ? null : (avatarLast?.outcome ?? null),
+      agents: avatarAgents,
+      errors: working ? errorsThisTurn : (avatarLast?.errors ?? 0),
+    }
+    return { state, t: (companionStep - avatarSince) * COMPANION_MS, ev }
+  }
   /** The first and last control of the tab as last drawn, the header's dots left out. */
   let ring: { first?: string; last?: string } = {}
   let lastRateWarn = 0
@@ -881,7 +857,13 @@ export const register: Register = on => {
   // ---- turns ---------------------------------------------------------------
 
   on('turn.start', async ($, e, next) => {
-    if (e.agentId !== undefined) return next(e)
+    if (e.agentId !== undefined) {
+      void liveAgentCount($).then(n => {
+        avatarAgents = n
+      })
+      return next(e)
+    }
+    avatarLast = undefined
     const now = await $.clock.now()
     toolsThisTurn = 0
     errorsThisTurn = 0
@@ -902,6 +884,9 @@ export const register: Register = on => {
       } catch {
         /* no agent list: stay quiet */
       }
+      void liveAgentCount($).then(n => {
+        avatarAgents = n
+      })
       return next(e)
     }
 
@@ -936,6 +921,11 @@ export const register: Register = on => {
     }
     await update($, turns, l => [...l, record].slice(-100))
 
+    const failed = e.reason === 'error' || e.reason === 'refusal'
+    avatarLast = {
+      outcome: e.isAborted || e.reason === 'aborted' ? 'stopped' : failed ? null : 'done',
+      errors: errors + (failed ? 1 : 0),
+    }
     const clean = errors === 0 && e.reason === 'answer' && !e.isAborted
     const tot = await update($, totals, t => {
       const streak = clean ? t.streak + 1 : 0
@@ -975,10 +965,17 @@ export const register: Register = on => {
     const id = e.tool_use_id ?? `${e.tool}-${startedAt}`
     const entry: Activity = { id, tool: e.tool, label: labelOf(e.tool, e), status: 'run', at: startedAt }
     toolsThisTurn += 1
+    // The figure follows the main loop's own calls, not a subagent's.
+    const loop = e.agentId === undefined ? avatarToolState(e.tool) : undefined
+    if (loop !== undefined) avatarTools.set(id, loop)
 
     await update($, activity, list => [...list, entry].slice(-60))
 
-    const ran = await next(e)
+    const ran = await next(e).finally(() => {
+      if (loop === undefined) return
+      avatarTools.delete(id)
+      avatarHeld = { state: loop, step: companionStep }
+    })
 
     const ms = (await $.clock.now()) - startedAt
     const isError = ran.deny !== undefined || ran.isError === true
@@ -1427,7 +1424,6 @@ export const register: Register = on => {
         const more = visible.length - shown.length
 
         // The figure stands on the footer, in the rows the sections above leave free.
-        const figure = p.companion && Raster !== undefined ? await loadSprite($) : null
         const noteRows =
           visible.length === 0
             ? 1
@@ -1437,42 +1433,46 @@ export const register: Register = on => {
         const usedRows = 2 + 7 + 6 + 2 + noteRows + 1 + 5 + 1
         const freeRows = e.props.scroll.bodyRows - usedRows
         const fit =
-          figure !== null && e.props.placement === 'dock' && figure.height / 2 <= freeRows && figure.width <= cols
-            ? figure
+          p.companion && Raster !== undefined && e.props.placement === 'dock' && AVATAR_H / 2 <= freeRows && AVATAR_W <= cols
+            ? { bubbles: AVATAR_W + BUBBLE_W <= cols }
             : undefined
         companionDrawn = fit
+        avatarAgents = liveAgents
+        const picture = (() => {
+          if (fit === undefined) return undefined
+          const a = avatarNow(run !== null)
+          return avatarCells(a.state, a.t, fit.bubbles ? a.ev : null)
+        })()
         if (fit !== undefined && companionTimer === undefined) {
           companionMisses = 0
           companionTimer = $.clock.every(COMPANION_MS, () => {
             void (async () => {
               companionStep += 1
+              // Agents starting and stopping set the count; this catches what those miss.
+              if (companionStep % 50 === 0) avatarAgents = await liveAgentCount($)
               const working = (await read($, running)) !== null
-              const frame = companionFrame(working, companionStep)
               const drawn = companionDrawn
+              const a = avatarNow(working)
+              const ev = drawn?.bubbles ? a.ev : null
+              const key = avatarKey(a.state, a.t, ev)
               // Repaint only when the picture changes; one check a second tells whether it is still on screen.
-              if (drawn === undefined || (frame === companionShown && companionStep % 5 !== 0)) {
+              if (drawn === undefined || (key === companionShown && companionStep % 10 !== 0)) {
                 if (drawn === undefined) companionMisses += 1
-                if (companionMisses >= 15) {
+                if (companionMisses >= 30) {
                   companionTimer?.cancel()
                   companionTimer = undefined
-                  spriteCells.clear()
+                  clearAvatarCells()
                 }
                 return
               }
-              const r = await $.ui.blit({
-                requestId: PANE,
-                key: COMPANION_KEY,
-                cells: companionCells(drawn, frame),
-                columns: drawn.width,
-                rows: drawn.height / 2,
-              })
-              companionShown = r.deny === undefined ? frame : -1
+              const r = await $.ui.blit({ requestId: PANE, key: COMPANION_KEY, ...avatarCells(a.state, a.t, ev) })
+              companionShown = r.deny === undefined ? key : ''
               // Not on screen (another tab, minimized, closed): stop after about three seconds.
               companionMisses = r.deny === undefined ? 0 : companionMisses + 1
               if (companionMisses >= 3) {
                 companionTimer?.cancel()
                 companionTimer = undefined
-                spriteCells.clear()
+                clearAvatarCells()
               }
             })().catch(() => {})
           })
@@ -1606,14 +1606,9 @@ export const register: Register = on => {
                 </Box>
               )}
             </Box>
-            {fit !== undefined && Raster !== undefined && (
+            {picture !== undefined && Raster !== undefined && (
               <Box flexDirection="column" flexGrow={1} justifyContent="flex-end" alignItems="center">
-                <Raster
-                  key={COMPANION_KEY}
-                  columns={fit.width}
-                  rows={fit.height / 2}
-                  cells={companionCells(fit, companionFrame(run !== null, companionStep))}
-                />
+                <Raster key={COMPANION_KEY} columns={picture.columns} rows={picture.rows} cells={picture.cells} />
               </Box>
             )}
           </Box>
