@@ -614,6 +614,8 @@ export const register: Register = on => {
   let avatarAgents = 0
   /** How the last turn ended and its errors; undefined once the next turn starts. */
   let avatarLast: { outcome: 'done' | 'stopped' | null; errors: number } | undefined
+  /** The effort the main loop's last request went out at; unknown until the first one. */
+  let effortSeen: string | undefined
   /** What the figure shows now: a running tool's loop, else agents, thinking or idle; and the bubbles. */
   const avatarNow = (working: boolean): { state: AvatarState; t: number; ev: AvatarEvents } => {
     const active = [...avatarTools.values()]
@@ -855,6 +857,12 @@ export const register: Register = on => {
   }).catch(($, e, next) => next(e))
 
   // ---- turns ---------------------------------------------------------------
+
+  // The engine has no "current effort" to read: each request carries its own.
+  on('turn.step', async function* (_$, e, next) {
+    if (e.agentId === undefined) effortSeen = e.effort === undefined ? undefined : String(e.effort)
+    return yield* next(e)
+  })
 
   on('turn.start', async ($, e, next) => {
     if (e.agentId !== undefined) {
@@ -1410,7 +1418,12 @@ export const register: Register = on => {
     let body
     switch (active) {
       case 'Overview': {
-        const [pct, liveAgents, engine] = await Promise.all([contextPercent($), liveAgentCount($), engineVersion($)])
+        const [pct, liveAgents, engine, model] = await Promise.all([
+          contextPercent($),
+          liveAgentCount($),
+          engineVersion($),
+          $.session.model().catch(() => '—'),
+        ])
         // While a turn runs, redraw with the clock so "working 0:42" keeps counting.
         if (run !== null) await read($, tick)
         const elapsed = run === null ? 0 : Math.max(0, Math.round((now - run.startedAt) / 1000))
@@ -1429,8 +1442,8 @@ export const register: Register = on => {
             ? 1
             : shown.reduce((n, nt) => n + Math.max(1, Math.ceil(nt.text.length / Math.max(8, cols - 8))), 0) +
               (more > 0 || (notesOpen && visible.length > NOTES_SHOWN) ? 1 : 0)
-        // header 2 · NOW 7 · LAST TURN 6 · NOTICES title 2 · footer 1 · five gaps, and one more above the figure
-        const usedRows = 2 + 7 + 6 + 2 + noteRows + 1 + 5 + 1
+        // header 2 · NOW 8 · LAST TURN 6 · NOTICES title 2 · footer 1 · five gaps, and one more above the figure
+        const usedRows = 2 + 8 + 6 + 2 + noteRows + 1 + 5 + 1
         const freeRows = e.props.scroll.bodyRows - usedRows
         const fit =
           p.companion && Raster !== undefined && e.props.placement === 'dock' && AVATAR_H / 2 <= freeRows && AVATAR_W <= cols
@@ -1511,6 +1524,13 @@ export const register: Register = on => {
                 'context',
                 pct === null ? '—' : meter(pct, levelTone(pct)),
                 <Text color={pct === null ? 'inactive' : levelTone(pct)}>{pct === null ? '' : `${pct}%`}</Text>,
+              )}
+              {field(
+                'model',
+                <Text wrap="truncate-end">
+                  {model}
+                  {effortSeen !== undefined && <Text color="inactive"> · {effortSeen}</Text>}
+                </Text>,
               )}
               {field('turn', String(turnNo))}
               {field(
